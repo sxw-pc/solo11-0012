@@ -1,0 +1,58 @@
+# 场景：离线 IoT 设备长周期运行数据，希望用 5 级策略最大化存储压缩。
+# 建议：长期归档优先保证可追溯，不要为了压缩率把 archive 粒度调到超过 7d。
+# gap_strategy=ffill 适合状态型指标；环境测量更建议 null 或 skip。
+version: 1
+name: iot_device_five_tier
+reference: data_max
+quality:
+  value_ranges:
+    temperature: {min: -50, max: 150}
+    humidity: {min: 0, max: 100}
+    pressure: {min: 800, max: 1200}
+    battery: {min: 0, max: 100}
+tiers:
+  # 最近 3 天：30 秒粒度。设备刚上报的数据优先保真。
+  - name: hot
+    granularity: 30s
+    retention_days: 3
+    path: tiers/hot
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, battery: min}
+    gap_strategy: skip
+  # 3~14 天：5 分钟粒度。
+  - name: warm
+    granularity: 5m
+    retention_days: 14
+    path: tiers/warm
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, battery: min}
+    gap_strategy: null
+  # 14~60 天：小时粒度。
+  - name: cold
+    granularity: 1h
+    retention_days: 60
+    path: tiers/cold
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, battery: min}
+    gap_strategy: null
+  # 60~180 天：日粒度，用于月度趋势与审计。
+  - name: deep
+    granularity: 1d
+    retention_days: 180
+    path: tiers/deep
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, temperature: max, battery: min}
+    gap_strategy: skip
+  # 180 天以后：7 天粒度封装，适合超长期离线留存。
+  - name: archive
+    granularity: 7d
+    retention_days: 730
+    path: archives
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, temperature: max, battery: min}
+    gap_strategy: skip

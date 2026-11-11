@@ -1,0 +1,49 @@
+# 场景：小团队本地服务器监控指标，采集较密、查询集中在近一个月。
+# 建议：若磁盘偏紧，把 warm 的压缩从 zstd 改为 gzip，并把 cold 粒度调到 1h。
+# 注意：tiers 必须由细到粗，granularity 和 retention_days 都必须严格递增。
+version: 1
+name: server_metric_four_tier
+reference: data_max
+quality:
+  value_ranges:
+    temperature: {min: -20, max: 120}  # 机箱进风/CPU 温度
+    voltage: {min: 180, max: 260}      # 市电波动范围
+    current: {min: 0, max: 100}        # 单路电流
+    pressure: {min: 800, max: 1200}    # 环境传感器
+tiers:
+  # 15 秒粒度保留 7 天，兼顾峰值与磁盘占用。
+  - name: hot
+    granularity: 15s
+    retention_days: 7
+    path: tiers/hot
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, voltage: min, current: max}
+    gap_strategy: skip
+  # 一周到一个月按分钟归档，适合容量趋势分析。
+  - name: warm
+    granularity: 1m
+    retention_days: 30
+    path: tiers/warm
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, voltage: min, current: max}
+    gap_strategy: null
+  # 一月至半年按 5 分钟聚合，仍保留较大的时间分辨率。
+  - name: cold
+    granularity: 5m
+    retention_days: 180
+    path: tiers/cold
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, voltage: min, current: max}
+    gap_strategy: null
+  # 半年以上按小时聚合为压缩包；一级索引记录包内偏移，二级索引记录标签。
+  - name: archive
+    granularity: 1h
+    retention_days: 730
+    path: archives
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, voltage: min, current: max}
+    gap_strategy: skip

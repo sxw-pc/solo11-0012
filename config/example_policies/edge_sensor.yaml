@@ -1,0 +1,40 @@
+# 场景：边缘网关本地传感器（震动/温度），数据量中等，重视近 7 天原始排查能力。
+# 建议：现场网络完全断开时直接复制本文件为工作目录 policy.yaml。
+# 调整抓手：hot.retention_days 控制原始粒度保留天数；archive.granularity 控制冷归档体积。
+version: 1
+name: edge_sensor_three_tier
+reference: data_max
+quality:
+  value_ranges:
+    temperature: {min: -40, max: 125}   # 工业传感器常见量程，按探头型号调整
+    humidity: {min: 0, max: 100}       # 百分比，原则上不得越界
+    vibration: {min: 0, max: 50}       # 振动加速度，按设备工况调整
+    pressure: {min: 800, max: 1200}    # 大气压传感器
+tiers:
+  # 近 7 天保留 10 秒原始粒度；震动对峰值敏感，因此使用 max，其余指标取均值。
+  - name: hot
+    granularity: 10s
+    retention_days: 7
+    path: tiers/hot
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, vibration: max}
+    gap_strategy: skip              # 不补缺失分片，保持原始观测节奏
+  # 7~30 天降为分钟级，现场排障通常不再需要 10 秒点。
+  - name: warm
+    granularity: 1m
+    retention_days: 30
+    path: tiers/warm
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, vibration: max}
+    gap_strategy: null              # 补空桶，便于按分钟对齐分析
+  # 30 天以后按小时聚合并封装为归档包；归档包默认保留。
+  - name: archive
+    granularity: 1h
+    retention_days: 180
+    path: archives
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, vibration: max}
+    gap_strategy: skip

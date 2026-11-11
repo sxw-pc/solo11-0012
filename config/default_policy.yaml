@@ -1,0 +1,54 @@
+# 时档匠默认热-温-冷-归档四级策略
+# 所有时间边界都相对于数据源自身的最大时间戳，而不是机器时钟，
+# 因此离线重跑、历史数据回放都能得到完全一致的分层结果。
+version: 1
+name: default_hot_warm_cold_archive
+reference: data_max
+
+quality:
+  # 异常值判定阈值；未列出的指标不做阈值判定。
+  value_ranges:
+    temperature: {min: -50, max: 150}
+    humidity: {min: 0, max: 100}
+    pressure: {min: 800, max: 1200}
+    vibration: {min: 0, max: 20}
+    voltage: {min: 180, max: 260}
+    current: {min: 0, max: 100}
+
+tiers:
+  # 热层：最近 30 天，保持接入原始粒度，供高频排查。
+  - name: hot
+    granularity: 10s
+    retention_days: 30
+    path: tiers/hot
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, vibration: max}
+    gap_strategy: skip
+  # 温层：30~90 天，降采样至分钟级。
+  - name: warm
+    granularity: 1m
+    retention_days: 90
+    path: tiers/warm
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean, vibration: max}
+    gap_strategy: skip
+  # 冷层：90~365 天，降采样至小时级并以更强压缩保存。
+  - name: cold
+    granularity: 1h
+    retention_days: 365
+    path: tiers/cold
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, pressure: max}
+    gap_strategy: null
+  # 归档层：超过 365 天，按天聚合后封装为确定性 tar.gz 包并建立两级索引。
+  - name: archive
+    granularity: 1d
+    retention_days: 730
+    path: archives
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean, temperature: max}
+    gap_strategy: skip
