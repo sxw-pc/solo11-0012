@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}生命周期策略{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">POLICY</p>
+    <h1>声明式生命周期策略</h1>
+    <p>修改 YAML 后会在保存前完成字段级校验，非法配置不会进入运行态。</p>
+  </div>
+  <div class="hash-pill">SHA256 {{ policy.hash[:16] }}</div>
+</section>
+
+{% if errors %}
+<div class="notice danger">
+  <strong>配置未保存</strong>
+  <ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+{% if message %}<div class="notice success">{{ message }}</div>{% endif %}
+
+<div class="grid two-col">
+  <section class="panel">
+    <h2>当前生效层级</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>层级</th><th>粒度</th><th>保留</th><th>格式</th><th>压缩</th><th>缺失策略</th></tr></thead>
+        <tbody>
+        {% for tier in policy.tiers %}
+          <tr>
+            <td><span class="tier tier-{{ tier.name }}">{{ tier.name }}</span></td>
+            <td>{{ tier.granularity }}</td>
+            <td>{{ tier.retention_days }} 天</td>
+            <td>{{ tier.format }}</td>
+            <td>{{ tier.compression }}</td>
+            <td>{{ tier.gap_strategy }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <h3>指标聚合规则</h3>
+    <div class="chips">
+      {% for tier in policy.tiers %}
+        {% for metric, operator in tier.aggregations.items() %}
+          <span class="chip">{{ tier.name }} · {{ metric }} → {{ operator }}</span>
+        {% endfor %}
+      {% endfor %}
+    </div>
+    <p class="hint">保留周期边界以数据源最大时间戳为基准，不依赖机器时钟，因此离线回放可复现。</p>
+  </section>
+
+  <form class="panel" method="post" action="{{ url_for('main.policy_page') }}">
+    <div class="panel-head">
+      <h2>YAML 编辑器</h2>
+      <span class="hint">保存 = 校验 + 原子替换</span>
+    </div>
+    <textarea name="yaml_text" spellcheck="false" aria-label="策略 YAML">{{ yaml_text }}</textarea>
+    <div class="form-actions">
+      <button class="primary" type="submit">校验并保存</button>
+      <button class="ghost" type="reset">撤销编辑</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

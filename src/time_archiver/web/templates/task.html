@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}任务与监控{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">TASKS</p>
+    <h1>归档任务与运行状态</h1>
+    <p>单节点串行执行；任务进度持久化到 SQLite，同输入同配置自动跳过。</p>
+  </div>
+  <button class="ghost" type="button" data-refresh-tasks>刷新状态</button>
+</section>
+
+{% if message %}<div class="notice success">{{ message }}</div>{% endif %}
+{% if errors %}
+<div class="notice danger"><strong>部分操作未完成</strong><ul>
+{% for error in errors %}<li>{{ error }}</li>{% endfor %}
+</ul></div>
+{% endif %}
+{% if results is defined and results %}
+<div class="notice success">
+  本次运行：
+  {% for item in results %}<span class="chip">{{ item.source }} · {{ item.shards }} 分片{% if item.cached %} · 命中缓存{% endif %}</span>{% endfor %}
+</div>
+{% endif %}
+
+<div class="metrics">
+  <div class="metric"><span>任务数</span><strong>{{ counts.tasks }}</strong></div>
+  <div class="metric"><span>活跃分片</span><strong>{{ counts.shards }}</strong></div>
+  <div class="metric"><span>归档索引</span><strong>{{ index.index_shards }}</strong></div>
+  <div class="metric"><span>审计链</span><strong class="{{ 'ok' if audit.valid else 'bad' }}">{{ '有效' if audit.valid else '异常' }}</strong></div>
+</div>
+
+<div class="grid two-col task-layout">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>手动触发</h2>
+      <span class="hint">同步执行，结果立即落盘</span>
+    </div>
+    <form method="post" action="{{ url_for('main.run_task') }}" class="stack">
+      <label>数据源模式
+        <select name="mode" id="run-mode">
+          <option value="demo">内置 mock 演示数据（三个源）</option>
+          <option value="custom">本地自定义数据源</option>
+        </select>
+      </label>
+      <div class="custom-source" data-custom-source hidden>
+        <label>文件路径<input name="source_path" placeholder="本地 Parquet / CSV / SQLite 绝对或相对路径"></label>
+        <div class="form-row">
+          <label>格式
+            <select name="format"><option>parquet</option><option>csv</option><option>sqlite</option></select>
+          </label>
+          <label>SQLite 表名<input name="table" placeholder="仅 sqlite 需要"></label>
+        </div>
+        <label>时间戳列<input name="timestamp_column" value="timestamp"></label>
+        <label>标签列（逗号分隔）<input name="label_columns" value="sensor_id"></label>
+        <label>指标列（逗号分隔）<input name="metric_columns" value="value"></label>
+        <label>数据源标识<input name="source_id" placeholder="留空则使用文件名"></label>
+      </div>
+      <button class="primary" type="submit">开始归档</button>
+    </form>
+    <p class="hint">演示数据模式会读取只读 fixture，覆盖接入校验、降采样、分层、归档与索引全链路。</p>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><h2>内置演示数据</h2></div>
+    <p class="hint">{{ fixture_summary.description }}</p>
+    <div class="fixture-list">
+      {% for item in fixture_summary.files %}
+      <div class="fixture-row">
+        <div><strong>{{ item.source_id }}</strong><small>{{ item.file }}</small></div>
+        <div class="align-right"><span class="chip">{{ item.cadence }}</span><small>{{ item.rows }} 行 · 缺失 {{ (item.missing_ratio * 100)|round(1) }}%</small></div>
+      </div>
+      {% endfor %}
+    </div>
+    <p class="hint">总跨度 {{ fixture_summary.span_start[:10] }} → {{ fixture_summary.span_end[:10] }}，包含 5% 随机缺失和 2% 阈值异常。</p>
+  </section>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>任务历史</h2>
+    <span class="hint">最后 100 条</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>任务 ID</th><th>数据源</th><th>状态</th><th>阶段</th><th>分片</th><th>开始时间</th><th>结果摘要</th></tr></thead>
+      <tbody id="task-table-body">
+      {% for task in tasks %}
+        <tr id="task-{{ task.task_id }}" data-status="{{ task.status }}">
+          <td><code title="{{ task.task_id }}">{{ task.task_id[:18] }}</code></td>
+          <td>{{ task.source }}</td>
+          <td><span class="status status-{{ task.status }}">{{ task.status }}</span></td>
+          <td>{{ task.stage or '—' }}</td>
+          <td>{{ task.result.shards if task.result and task.result.shards is defined else '—' }}</td>
+          <td class="nowrap">{{ task.started_at }}</td>
+          <td>
+            {% if task.result and task.result.tiers is defined %}
+              {% for name, tier in task.result.tiers.items() %}
+                <span class="chip">{{ name }} {{ tier.rows }}</span>
+              {% endfor %}
+            {% else %}—{% endif %}
+            {% if task.error %}<div class="bad">{{ task.error[:160] }}</div>{% endif %}
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="empty">尚无任务。可使用演示数据模式启动首次归档。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

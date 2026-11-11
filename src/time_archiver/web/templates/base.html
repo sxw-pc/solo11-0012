@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{% block title %}{{ app_name }}{% endblock %} · 本地时序归档</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">时</span>
+      <div>
+        <strong>{{ app_name }}</strong>
+        <small>本地时序数据分层降质归档</small>
+      </div>
+    </div>
+    <nav aria-label="主导航">
+      <a href="{{ url_for('main.tasks_page') }}">任务</a>
+      <a href="{{ url_for('main.policy_page') }}">策略</a>
+      <a href="{{ url_for('main.archive_page') }}">归档检索</a>
+      <a href="{{ url_for('main.audit_page') }}">审计</a>
+    </nav>
+  </header>
+  <div class="offline-strip">
+    纯本地离线运行 · 服务绑定 {{ bind_host }} · 无外部资源 · 原始数据只读
+  </div>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">
+    <span>{{ app_name }} · 单节点离线数据工程工具</span>
+    <span>所有输出写入独立工作目录，归档包默认保留</span>
+  </footer>
+  <script src="{{ url_for('static', filename='common.js') }}" defer></script>
+</body>
+</html>

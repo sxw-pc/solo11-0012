@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}归档检索{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">ARCHIVE INDEX</p>
+    <h1>冷数据溯源检索</h1>
+    <p>时间分片索引 + 标签维度索引；先定位压缩包与成员偏移，再定点恢复。</p>
+  </div>
+  <div class="hash-pill">{{ index.index_shards }} 条时间索引 · {{ index.label_entries }} 条标签索引</div>
+</section>
+
+{% if errors %}
+<div class="notice danger"><strong>查询未执行</strong><ul>
+{% for error in errors %}<li>{{ error }}</li>{% endfor %}
+</ul></div>
+{% endif %}
+
+<form class="panel search-form" method="get" action="{{ url_for('main.archive_page') }}">
+  <label>起始时间<input type="text" name="start" value="{{ start }}" placeholder="2024-12-01 或 ISO 时间"></label>
+  <label>结束时间<input type="text" name="end" value="{{ end }}" placeholder="2025-12-31 或 ISO 时间"></label>
+  <label>标签键<input type="text" name="label_key" value="{{ label_key }}" placeholder="sensor_id"></label>
+  <label>标签值<input type="text" name="label_value" value="{{ label_value }}" placeholder="iot-node-01"></label>
+  <div class="form-actions"><button class="primary" type="submit">检索索引</button></div>
+</form>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>命中分片</h2>
+    <span class="hint">无需解压全量归档包即可获得成员偏移</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>层级</th><th>时间范围</th><th>压缩包</th><th>成员</th><th>偏移</th><th>数据量</th><th>标签</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for entry in entries %}
+        <tr>
+          <td><span class="tier tier-{{ entry.tier }}">{{ entry.tier }}</span></td>
+          <td class="nowrap">{{ entry.min_ts[:10] }} → {{ entry.max_ts[:10] }}</td>
+          <td><code title="{{ entry.package_path }}">{{ entry.package_path }}</code></td>
+          <td><code>{{ entry.member_name }}</code></td>
+          <td>{{ entry.offset }}</td>
+          <td>{{ entry.row_count }} 行 · {{ entry.size }} B</td>
+          <td>
+            {% for key, values in entry.tags.items() %}
+              <span class="chip">{{ key }}: {{ values|join(', ') }}</span>
+            {% endfor %}
+          </td>
+          <td>
+            <form method="post" action="{{ url_for('main.restore_archive') }}">
+              <input type="hidden" name="shard_id" value="{{ entry.shard_id }}">
+              <button class="small" type="submit">恢复下载</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="8" class="empty">没有匹配的归档分片。请先执行演示归档，或调整时间与标签条件。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}
