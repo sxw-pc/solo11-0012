@@ -11,3 +11,8 @@ work/
 demo_work/
 *.db-wal
 *.db-shm
+venv/
+node_modules/
+*.pyc
+.benchmarks/
+.env
