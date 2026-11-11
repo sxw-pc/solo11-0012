@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "seed": 202501,
+  "timezone": "UTC",
+  "description": "13个月合成环境传感器数据，5%随机缺失、2%阈值异常",
+  "span_start": "2024-12-01T00:00:00Z",
+  "span_end": "2025-12-31T23:59:50Z",
+  "files": [
+    {
+      "source_id": "high-freq-edge",
+      "sensor": "edge-gw-01",
+      "start": "2025-12-18T00:00:00",
+      "end": "2025-12-31T23:59:50",
+      "freq": "10s",
+      "seed": 202502,
+      "cadence": "10s",
+      "nominal_rows": 120960,
+      "file": "sensor_high_freq.parquet",
+      "rows": 114912,
+      "sha256": "cd6659dc145122041a4823febf57ad84759d41968fb080b7010838b062862999",
+      "span_start": "2025-12-18T00:00:00Z",
+      "span_end": "2025-12-31T23:59:50Z",
+      "missing_rows_removed": 6048
+    },
+    {
+      "source_id": "mid-freq-server",
+      "sensor": "srv-metric-01",
+      "start": "2025-10-01T00:00:00",
+      "end": "2025-12-31T23:59:00",
+      "freq": "1min",
+      "seed": 202503,
+      "cadence": "1m",
+      "nominal_rows": 132480,
+      "file": "sensor_mid_freq.parquet",
+      "rows": 125856,
+      "sha256": "07e4197120c916bc00d448e74e46ed197c4f6891da2fd5804ab3eafbea8a2476",
+      "span_start": "2025-10-01T00:00:00Z",
+      "span_end": "2025-12-31T23:59:00Z",
+      "missing_rows_removed": 6624
+    },
+    {
+      "source_id": "low-freq-iot",
+      "sensor": "iot-node-01",
+      "start": "2024-12-01T00:00:00",
+      "end": "2025-12-31T23:00:00",
+      "freq": "1h",
+      "seed": 202504,
+      "cadence": "1h",
+      "nominal_rows": 9504,
+      "file": "sensor_low_freq.parquet",
+      "rows": 9029,
+      "sha256": "5aac038e6a40588920bc837a71f1ec035e86400f084c60ec0a1431a7063e7dea",
+      "span_start": "2024-12-01T00:00:00Z",
+      "span_end": "2025-12-31T23:00:00Z",
+      "missing_rows_removed": 475
+    }
+  ]
+}
