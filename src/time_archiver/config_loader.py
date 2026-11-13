@@ -218,7 +218,8 @@ def save_policy_text(path: Path, text: str, workdir: Path) -> Policy:
 def init_workspace(workdir: Path, policy_source: Optional[Path] = None) -> Path:
     """初始化独立工作目录并复制默认策略。"""
     workdir = Path(workdir)
-    for relative in ("state", "audit", "staging", "tiers", "archives", "restored"):
+    for relative in ("state", "audit", "staging", "tiers", "archives",
+                     "restored", "plans"):
         (workdir / relative).mkdir(parents=True, exist_ok=True)
     source = Path(policy_source) if policy_source else DEFAULT_POLICY_PATH
     target = workdir / "policy.yaml"

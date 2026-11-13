@@ -91,6 +91,18 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
                           source_id: str,
                           index_path: str = "") -> Tuple[str, int, List[IndexEntry]]:
     """封装 data + index.json，注册时间偏移索引与标签索引。"""
+    package_bytes, digest, entries = archive_package_bytes(
+        frame, tier, label_columns, metric_columns, source_id,
+        relative_path=index_path or str(package_path))
+    atomic_write(package_path, package_bytes)
+    return digest, len(package_bytes), entries
+
+
+def archive_package_bytes(frame: pd.DataFrame, tier: PolicyTier,
+                          label_columns: Iterable[str], metric_columns: Iterable[str],
+                          source_id: str,
+                          relative_path: str = "") -> Tuple[bytes, str, List[IndexEntry]]:
+    """纯内存构造确定性 tar.gz 字节；预算推演与正式落盘共用，保证字节一致。"""
     labels, metrics = list(label_columns), list(metric_columns)
     payload = serialize_frame(frame, tier.format, tier.compression)
     tags = _column_tags(frame, labels)
@@ -114,15 +126,13 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
     raw_tar = _make_tar(members)
     offset, size = _member_span(raw_tar, member_name)
     package_bytes = gzip.compress(raw_tar, compresslevel=6, mtime=0)
-    atomic_write(package_path, package_bytes)
-    relative = index_path or str(package_path)
     entry = IndexEntry(
-        shard_id="", package_path=relative, member_name=member_name,
+        shard_id="", package_path=relative_path, member_name=member_name,
         offset=offset, size=size, row_count=int(len(frame)),
         min_ts=min_ts, max_ts=max_ts, tags=tags, tier=tier.name,
         source=source_id,
     )
-    return bytes_sha256(package_bytes), len(package_bytes), [entry]
+    return package_bytes, bytes_sha256(package_bytes), [entry]
 
 
 def _make_tar(members: List[Tuple[str, bytes]]) -> bytes:

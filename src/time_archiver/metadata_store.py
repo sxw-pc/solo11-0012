@@ -40,6 +40,16 @@ class MetadataStore:
     def init_schema(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_journal_paths(connection)
+
+    def _migrate_journal_paths(self, connection) -> None:
+        """旧工作目录的 reorg_journals 缺少 stale_paths 列时幂等补齐。"""
+        columns = {row["name"] for row in
+                   connection.execute("PRAGMA table_info(reorg_journals)").fetchall()}
+        if columns and "stale_paths_json" not in columns:
+            connection.execute(
+                "ALTER TABLE reorg_journals "
+                "ADD COLUMN stale_paths_json TEXT NOT NULL DEFAULT '[]'")
 
     def start_task(self, task_id: str, kind: str, source: str,
                    policy_hash: str, range_start: str = "",
@@ -269,6 +279,165 @@ class MetadataStore:
                 "archives": connection.execute(
                     "SELECT COUNT(*) FROM archive_index").fetchone()[0],
             }
+
+    # ------------------------------------------------------------------
+    # 预算方案与重排日志
+    # ------------------------------------------------------------------
+
+    def save_plan(self, plan_id: str, source_id: str, source_hash: str,
+                  policy_hash: str, budget_bytes: int, merge_oldest: bool,
+                  within_budget: bool, projected_bytes: int, baseline_bytes: int,
+                  plan_path: str, plan_hash: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO plans(plan_id,source_id,source_hash,policy_hash,"
+                "budget_bytes,merge_oldest,within_budget,projected_bytes,"
+                "baseline_bytes,plan_path,plan_hash,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(plan_id) DO NOTHING",
+                (plan_id, source_id, source_hash, policy_hash, int(budget_bytes),
+                 1 if merge_oldest else 0, 1 if within_budget else 0,
+                 int(projected_bytes), int(baseline_bytes), plan_path, plan_hash,
+                 utc_now()))
+
+    def get_plan_row(self, plan_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM plans WHERE plan_id=?", (plan_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_plans(self, limit: int = 50) -> list[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM plans ORDER BY rowid DESC LIMIT ?",
+                (int(limit),)).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_shards_for_source(self, source: str) -> list[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM shards WHERE source=? AND active=1 "
+                "ORDER BY tier, partition", (source,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_journal(self, journal: Dict[str, Any]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO reorg_journals(journal_id,plan_id,task_id,source_id,"
+                "state,stage,plan_hash,new_shards_json,stale_shards_json,"
+                "stale_paths_json,quarantined_json,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(journal_id) DO UPDATE SET state=excluded.state,"
+                "stage=excluded.stage,stale_paths_json=excluded.stale_paths_json,"
+                "quarantined_json=excluded.quarantined_json,updated_at=excluded.updated_at",
+                (journal["journal_id"], journal["plan_id"], journal["task_id"],
+                 journal["source_id"], journal["state"], journal["stage"],
+                 journal["plan_hash"],
+                 json.dumps(journal["new_shards"], ensure_ascii=False, sort_keys=True),
+                 json.dumps(journal["stale_shards"], ensure_ascii=False, sort_keys=True),
+                 json.dumps(journal.get("stale_paths", []),
+                            ensure_ascii=False, sort_keys=True),
+                 json.dumps(journal["quarantined"], ensure_ascii=False, sort_keys=True),
+                 journal["created_at"], utc_now()))
+
+    def get_journal(self, journal_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM reorg_journals WHERE journal_id=?",
+                (journal_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        for key in ("new_shards", "stale_shards", "stale_paths", "quarantined"):
+            item[key] = _loads(item.pop(f"{key}_json", None), [])
+        return item
+
+    def list_journals(self, state: Optional[str] = None) -> list[Dict[str, Any]]:
+        query = "SELECT * FROM reorg_journals"
+        values: list[Any] = []
+        if state:
+            query += " WHERE state=?"
+            values.append(state)
+        query += " ORDER BY rowid"
+        with self._connect() as connection:
+            rows = connection.execute(query, values).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            for key in ("new_shards", "stale_shards", "stale_paths", "quarantined"):
+                item[key] = _loads(item.pop(f"{key}_json", None), [])
+            output.append(item)
+        return output
+
+    def commit_reorg(self, task_id: str, new_records: list, new_entries: list,
+                     stale_shard_ids: list) -> None:
+        """单事务原子切换：写入新分片指针与索引、停用陈旧分片并清理其索引。
+
+        文件系统上的正式分片在调用本方法前已全部落盘并通过校验；
+        本事务保证指针、历史与两级索引整体成功或整体回滚，
+        因此「清理陈旧正式文件与索引」和「重排」对外呈现为一次原子状态变更。
+        """
+        with self._connect() as connection:
+            for record in new_records:
+                old = connection.execute(
+                    "SELECT * FROM shards WHERE shard_id=?",
+                    (record.shard_id,)).fetchone()
+                if old and not (old["sha256"] == record.sha256 and
+                                old["path"] == record.path and old["active"]):
+                    connection.execute(
+                        "INSERT INTO shard_history(shard_id,task_id,prev_task_id,"
+                        "prev_path,prev_format,prev_sha256,prev_row_count,changed_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (record.shard_id, record.task_id, old["task_id"], old["path"],
+                         old["format"], old["sha256"], old["row_count"], utc_now()))
+                connection.execute(
+                    "INSERT INTO shards(shard_id,task_id,tier,source,partition,path,"
+                    "format,row_count,raw_count,missing_count,anomaly_count,sha256,"
+                    "created_at,active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1) "
+                    "ON CONFLICT(shard_id) DO UPDATE SET task_id=excluded.task_id,"
+                    "tier=excluded.tier,source=excluded.source,"
+                    "partition=excluded.partition,path=excluded.path,"
+                    "format=excluded.format,row_count=excluded.row_count,"
+                    "raw_count=excluded.raw_count,missing_count=excluded.missing_count,"
+                    "anomaly_count=excluded.anomaly_count,sha256=excluded.sha256,"
+                    "created_at=excluded.created_at,active=1",
+                    (record.shard_id, record.task_id, record.tier, record.source,
+                     record.partition, record.path, record.fmt, record.row_count,
+                     record.raw_count, record.missing_count, record.anomaly_count,
+                     record.sha256, record.created_at or utc_now()))
+            # 复用 shard_id 的分片（同层同月、内容由天级截断升级为整月版）
+            # 已在上面 upsert 为活跃的新记录，绝不能再被停用。
+            reused = {record.shard_id for record in new_records}
+            for shard_id in stale_shard_ids:
+                if shard_id in reused:
+                    continue
+                connection.execute(
+                    "UPDATE shards SET active=0 WHERE shard_id=?", (shard_id,))
+                connection.execute(
+                    "DELETE FROM archive_index WHERE shard_id=?", (shard_id,))
+                connection.execute(
+                    "DELETE FROM label_index WHERE shard_id=?", (shard_id,))
+            for entry in new_entries:
+                connection.execute(
+                    "DELETE FROM archive_index WHERE shard_id=?", (entry.shard_id,))
+                connection.execute(
+                    "DELETE FROM label_index WHERE shard_id=?", (entry.shard_id,))
+            for entry in new_entries:
+                connection.execute(
+                    "INSERT INTO archive_index(shard_id,package_path,member_name,"
+                    "offset,size,row_count,min_ts,max_ts,tags_json,tier,source) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (entry.shard_id, entry.package_path, entry.member_name,
+                     entry.offset, entry.size, entry.row_count, entry.min_ts,
+                     entry.max_ts,
+                     json.dumps(entry.tags, ensure_ascii=False, sort_keys=True),
+                     entry.tier, entry.source))
+                for key, values in sorted(entry.tags.items()):
+                    for value in sorted(set(map(str, values))):
+                        connection.execute(
+                            "INSERT OR IGNORE INTO label_index(shard_id,tag_key,"
+                            "tag_value) VALUES(?,?,?)",
+                            (entry.shard_id, key, value))
 
 
 def _loads(value: Optional[str], default: Any) -> Any:

@@ -35,5 +35,21 @@ CREATE INDEX IF NOT EXISTS idx_archive_time ON archive_index(min_ts, max_ts);
 CREATE INDEX IF NOT EXISTS idx_label_lookup ON label_index(tag_key, tag_value);
 CREATE INDEX IF NOT EXISTS idx_shards_tier ON shards(tier, active);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, started_at);
+CREATE TABLE IF NOT EXISTS plans (
+  plan_id TEXT PRIMARY KEY, source_id TEXT NOT NULL, source_hash TEXT NOT NULL,
+  policy_hash TEXT NOT NULL, budget_bytes INTEGER NOT NULL,
+  merge_oldest INTEGER NOT NULL, within_budget INTEGER NOT NULL,
+  projected_bytes INTEGER NOT NULL, baseline_bytes INTEGER NOT NULL,
+  plan_path TEXT NOT NULL, plan_hash TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reorg_journals (
+  journal_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  source_id TEXT NOT NULL, state TEXT NOT NULL, stage TEXT NOT NULL,
+  plan_hash TEXT NOT NULL, new_shards_json TEXT NOT NULL,
+  stale_shards_json TEXT NOT NULL, stale_paths_json TEXT NOT NULL DEFAULT '[]',
+  quarantined_json TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_journals_state ON reorg_journals(state);
 """
 

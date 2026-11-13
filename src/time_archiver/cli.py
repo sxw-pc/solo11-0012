@@ -180,6 +180,12 @@ cli.add_command(archive_cmd)
 cli.add_command(restore_cmd)
 cli.add_command(audit_export_cmd)
 
+from .cli_budget import plan_budget_cmd, plans_cmd, reorg_apply_cmd  # noqa: E402
+
+cli.add_command(plan_budget_cmd)
+cli.add_command(reorg_apply_cmd)
+cli.add_command(plans_cmd)
+
 
 if __name__ == "__main__":
     cli()

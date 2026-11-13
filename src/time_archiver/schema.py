@@ -194,6 +194,66 @@ class IndexEntry:
         return dict(self.__dict__)
 
 
+@dataclass(frozen=True)
+class TierBounds:
+    """预算方案中单个层级的自然月覆盖区间（闭区间，按月分片，无空洞无重叠）。"""
+
+    tier: str
+    start_month: str
+    end_month: str
+    months: int
+    retention_days: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "tier": self.tier, "start_month": self.start_month,
+            "end_month": self.end_month, "months": self.months,
+            "retention_days": self.retention_days,
+        }
+
+
+@dataclass(frozen=True)
+class BudgetPlan:
+    """可持久化、可复核、同输入同预算逐字节一致的预算推演方案。"""
+
+    plan_id: str
+    source: Dict[str, Any]
+    source_hash: str
+    policy_name: str
+    policy_hash: str
+    data_max: str
+    anchor_month: str
+    budget_bytes: int
+    tolerance: float
+    data_months: Tuple[str, ...]
+    bounds: Tuple[TierBounds, ...]
+    tier_limits: Tuple[int, ...]
+    merge_oldest: bool
+    feasible: bool
+    within_budget: bool
+    projected_bytes: int
+    baseline_bytes: int
+    per_tier_bytes: Dict[str, int]
+    moves: Tuple[str, ...]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "plan_id": self.plan_id, "source": dict(self.source),
+            "source_hash": self.source_hash, "policy_name": self.policy_name,
+            "policy_hash": self.policy_hash, "data_max": self.data_max,
+            "anchor_month": self.anchor_month, "budget_bytes": self.budget_bytes,
+            "tolerance": self.tolerance, "data_months": list(self.data_months),
+            "bounds": [bound.to_dict() for bound in self.bounds],
+            "tier_limits": list(self.tier_limits),
+            "merge_oldest": self.merge_oldest, "feasible": self.feasible,
+            "within_budget": self.within_budget,
+            "projected_bytes": self.projected_bytes,
+            "baseline_bytes": self.baseline_bytes,
+            "per_tier_bytes": dict(sorted(self.per_tier_bytes.items())),
+            "moves": list(self.moves),
+        }
+
+
 def parse_granularity(value: str) -> int:
     """将 10s / 1m / 1h / 1d 解析为秒，非法值抛出 ConfigError。"""
     match = re.fullmatch(r"\s*([1-9]\d*)\s*([smhd])\s*", str(value).lower())
