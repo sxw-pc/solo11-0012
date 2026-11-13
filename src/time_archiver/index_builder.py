@@ -148,7 +148,9 @@ def _member_span(raw_tar: bytes, member_name: str) -> Tuple[int, int]:
 def _time_bounds(frame: pd.DataFrame) -> Tuple[str, str]:
     if frame.empty or TIMESTAMP not in frame:
         return "", ""
-    values = pd.to_datetime(frame[TIMESTAMP], errors="coerce").dropna()
+    # 显式 mixed 解析，避免 pandas 2.x 的 infer 回退警告；统一按 UTC 归一。
+    values = pd.to_datetime(frame[TIMESTAMP], format="mixed",
+                            errors="coerce", utc=True).dropna()
     if values.empty:
         return "", ""
     return (_iso(values.min()), _iso(values.max()))
@@ -157,6 +159,7 @@ def _time_bounds(frame: pd.DataFrame) -> Tuple[str, str]:
 def _iso(value: Any) -> str:
     stamp = pd.Timestamp(value)
     if stamp.tzinfo is not None:
+        # 统一去掉时区后按 UTC 墙上时间输出，与读取链路的归一化保持一致。
         stamp = stamp.tz_convert(None)
     return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 

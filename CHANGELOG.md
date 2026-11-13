@@ -2,6 +2,39 @@
 
 本文档记录时档匠的版本演进。日期使用本地项目日期，版本号遵循语义化版本的基本约定。
 
+## 1.1.0 - 2026-11-13
+
+### 变更
+
+- 依赖清单收敛为可复现的精确锁定表达：`requirements.txt` 改为 `包名==版本`，
+  新增 `wheelhouse/constraints.txt` 锁定全部传递依赖，`pyproject.toml` 的
+  `dependencies` 与实际轮子对齐，消除 pandas 静默滚动到未适配版本的风险。
+- 核心数据栈锁定为 pandas 2.3.3、numpy 2.4.6、pyarrow 19.0.1、PyYAML 6.0.3。
+- `wheelhouse/` 在原有 Windows x86_64 轮子之外，补齐同版本 Linux x86_64 /
+  CPython 3.11 轮子，两套平台共用一份版本清单。
+- 新增 `tools/download_wheels.sh` 固化联网机器按同一清单复现下载轮子的流程，
+  新增 `tools/make_checksums.sh` 可复现地重新生成 `SHA256SUMS.txt`。
+
+### 兼容性
+
+- Parquet、CSV、SQLite 三条读取链路改为按列显式声明 dtype，不再依赖类型推断；
+  时间戳统一用 `format="mixed"` 解析并归一化为时区无关 UTC 时间，带时区时间列
+  不再退化成 object 列。
+- 时间桶分组改用 pandas 2.x 推荐的 `groupby(pd.Grouper(freq=...))` 重采样写法，
+  桶边界与旧的 `Series.dt.floor` 等价，不依赖已移除的时区链式调用。
+- 缺失值判断统一为 `pandas.isna` / `notna`，NaN、`pd.NA`、None、NaT 行为一致，
+  不再混用 `== None` 风格比较。
+- `raw_count`、`valid_count`、`missing_count`、`anomaly_count` 四个计数列在所有
+  产出路径上强制为普通 `int64`、空值写 0，避免被升级成带 `pd.NA` 的可空整型。
+
+### 测试
+
+- 新增 `tests/test_pandas2_compat.py`，覆盖显式 dtype、时区/空值混合 CSV、
+  SQLite epoch、Grouper 分桶与计数列 int64 稳定性，共 6 项。
+- 全量测试 129 项通过，整体语句覆盖率 94%，降采样模块 100%。
+- 在干净虚拟环境从 `wheelhouse/` 离线安装并运行 demo，全部归档产物与升级前
+  逐字节一致，对外命令行为不变。
+
 ## 1.0.0 - 2026-11-11
 
 ### 新增

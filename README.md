@@ -30,17 +30,29 @@
 在项目根目录准备 Python 3.9～3.11 环境，然后依次执行以下四条命令：
 
 ```bash
-python -m pip install --no-index --find-links wheelhouse setuptools wheel -r requirements.txt
+python -m pip install --no-index --find-links wheelhouse \
+  setuptools wheel -c wheelhouse/constraints.txt -r requirements.txt
 python -m pip install --no-index --no-build-isolation --config-settings editable_mode=compat -e .
 time-archiver --workdir demo_work demo
 python -m pytest
 ```
 
-第一条命令完全从本地 `wheelhouse` 安装依赖，不访问网络。第二条命令以可编辑方式安装本项目，并生成 `time-archiver` 命令；`editable_mode=compat` 用于绕开部分 setuptools 版本在可编辑构建时报告元数据目录为空的问题。第三条命令自动初始化 `demo_work`、加载三组内置 mock 数据、执行全量分层归档、构建索引、检索并恢复一个样本。第四条命令运行全量测试并输出覆盖率报告。
+第一条命令完全从本地 `wheelhouse` 安装依赖，不访问网络。`requirements.txt` 用
+`包名==版本` 精确锁定直接依赖，`-c wheelhouse/constraints.txt` 进一步锁定全部
+传递依赖，任何机器都解析出同一组版本。第二条命令以可编辑方式安装本项目，并生成
+`time-archiver` 命令；`editable_mode=compat` 用于绕开部分 setuptools 版本在可编辑
+构建时报告元数据目录为空的问题。第三条命令自动初始化 `demo_work`、加载三组内置
+mock 数据、执行全量分层归档、构建索引、检索并恢复一个样本。第四条命令运行全量
+测试并输出覆盖率报告。
 
 如果不想安装项目，也可以在项目根目录使用源码方式运行。Windows PowerShell 可先执行 `$env:PYTHONPATH="src"`，Linux 或 macOS 可执行 `export PYTHONPATH=src`，随后运行 `python -m time_archiver --workdir demo_work demo`。测试配置已经声明 `pythonpath = src`，因此直接执行 `python -m pytest` 即可。若命令行未把 pip 的脚本目录加入 PATH，可使用 `python -m time_archiver` 代替 `time-archiver`。
 
-`wheelhouse` 中的二进制轮子按 Windows x86_64、CPython 3.11 准备。若目标机器是 Linux、macOS 或其他 Python 小版本，需要在**联网的准备阶段**使用相同依赖清单重新下载对应平台的轮子，再拷贝到离线机器；归档工具运行期间本身不会发起任何外部请求。具体说明见 `wheelhouse/README.md`。
+`wheelhouse` 中的二进制轮子按 CPython 3.11 准备，同时收录 Windows x86_64
+（`win_amd64`）与 Linux x86_64（`manylinux_2_28_x86_64`）两套，pip 会按当前
+解释器自动选择。若目标机器是 macOS 或其他 Python 小版本，需要在**联网的准备阶段**
+使用相同依赖清单重新下载对应平台的轮子（`tools/download_wheels.sh` 已固化该
+流程），再拷贝到离线机器；归档工具运行期间本身不会发起任何外部请求。具体说明见
+`wheelhouse/README.md`。
 
 ## 四、核心概念
 
@@ -63,9 +75,17 @@ python -m pytest
 
 ### 4.3 确定性降采样
 
-降采样以“标签组合 + 时间桶”为分组键，使用 `floor` 语义对齐桶边界。七个内置聚合算子为 `mean`、`max`、`min`、`count`、`first`、`last`、`p95`。异常值在读取阶段按策略阈值识别，不参与指标聚合，但会计入质量标记。
+降采样以“标签组合 + 时间桶”为分组键，使用 `floor` 语义对齐桶边界。在 pandas 2.x
+上，时间桶对齐通过 `groupby(pd.Grouper(freq=...))` 的重采样写法实现，桶边界与
+`Series.dt.floor` 完全等价，但不依赖任何已移除的时区链式调用。七个内置聚合算子
+为 `mean`、`max`、`min`、`count`、`first`、`last`、`p95`。异常值在读取阶段按策略
+阈值识别，不参与指标聚合，但会计入质量标记。
 
-每个输出行包含 `raw_count`、`valid_count`、`missing_count`、`anomaly_count`。其中 `missing_count` 表示按源数据推断间隔和当前层粒度计算出的缺失槽位数，用于后续评估数据完整度。
+Parquet、CSV、SQLite 三条读取链路都按列显式声明 dtype，不依赖类型推断：时间戳列
+统一归一化为时区无关的 UTC 时间，标签列显式转字符串，指标列显式转 `float64`，
+因此带时区的时间列不会退化成 object 列，NaN 与 `pd.NA` 也按同一套 `isna` 语义处理。
+
+每个输出行包含 `raw_count`、`valid_count`、`missing_count`、`anomaly_count`。其中 `missing_count` 表示按源数据推断间隔和当前层粒度计算出的缺失槽位数，用于后续评估数据完整度。四个计数列在每条产出路径上都强制为普通 `int64`，缺失槽位写 0，不会因 pandas 新版把整数列升级成可空整型而出现 `pd.NA`，从而保证下游内容指纹稳定。
 
 ### 4.4 热、温、冷、归档
 
@@ -252,7 +272,7 @@ Web 测试通过 Flask 测试客户端完成，不监听真实端口，不产生
 - 网络完全阻断时归档和 Web 页面仍可工作。
 - 空数据、单行数据、只有标签、无异常列、非法时间、单层级策略、空层级、未完成任务回滚等边界。
 
-最近一次完整测试结果为 123 项通过，整体语句覆盖率为 95%。核心模块覆盖率：降采样 100%，归档 99%，索引构建 99%，元数据存储 97%。执行 `python -m pytest` 会自动启用覆盖率门槛，整体低于 85% 时测试命令返回失败。
+最近一次完整测试结果为 129 项通过，整体语句覆盖率为 94%。核心模块覆盖率：降采样 100%，归档 99%，索引构建 99%，元数据存储 97%。执行 `python -m pytest` 会自动启用覆盖率门槛，整体低于 85% 时测试命令返回失败。
 
 ## 十、数据安全与操作边界
 

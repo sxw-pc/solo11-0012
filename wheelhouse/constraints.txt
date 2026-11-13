@@ -1,0 +1,42 @@
+# 全量传递依赖锁定清单（constraints file）
+#
+# 本文件把 requirements.txt 中直接依赖的传递依赖一并钉到经离线验证的确切版本，
+# 保证任何机器、任何时间重新解析依赖图时得到同一组版本。
+#
+# 用法：
+#   离线安装：
+#     python -m pip install --no-index --find-links wheelhouse \
+#       -c wheelhouse/constraints.txt -r requirements.txt
+#   联网重新下载（平台参数按目标环境替换，详见 tools/download_wheels.sh）：
+#     python -m pip download -d wheelhouse --only-binary=:all: \
+#       --platform manylinux_2_28_x86_64 --python-version 311 \
+#       --implementation cp --abi cp311 \
+#       -c wheelhouse/constraints.txt -r requirements.txt
+#
+# 直接依赖（PyYAML/pandas/pyarrow/numpy/click/Flask/python-dateutil/
+# pytest/pytest-cov）的确切版本写在 requirements.txt；本文件补齐全部传递依赖。
+# 两个文件与 wheelhouse/ 下的实际轮子文件名必须保持一致，改动时三者同步更新。
+
+# --- 传递依赖：pandas / pyarrow / numpy 数据栈 ---
+pytz==2026.6
+six==1.17.0
+tzdata==2026.6
+
+# --- 传递依赖：click / Flask Web 栈 ---
+blinker==1.9.0
+colorama==0.4.6
+itsdangerous==2.2.0
+jinja2==3.1.6
+markupsafe==3.0.4
+werkzeug==3.1.9
+
+# --- 传递依赖：pytest / pytest-cov 测试栈 ---
+coverage==7.17.2
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0
+
+# --- 构建期依赖 ---
+setuptools==84.2.1
+wheel==0.48.0

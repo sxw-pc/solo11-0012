@@ -1,11 +1,19 @@
-"""Parquet / CSV / SQLite 多源时序数据只读接入与质量校验。"""
+"""Parquet / CSV / SQLite 多源时序数据只读接入与质量校验。
+
+pandas 2.x 适配约定：
+- Parquet / CSV / SQLite 三条读取链路都按列显式声明 dtype，不依赖类型推断，
+  避免时间列从时区感知退化成 object、数值列被升级成可空整型。
+- 时间戳统一经 ``_parse_timestamps`` 归一化为时区无关的 ``datetime64[ns]``（UTC 值），
+  下游所有 floor / groupby 都在同一时间语义下进行。
+- 缺失判断统一走 ``pandas.isna`` / ``notna``，NaN、pd.NA、None、NaT 一视同仁，
+  代码中不出现 ``== None`` 这类对 pd.NA 不成立的比较。
+"""
 from __future__ import annotations
 
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -42,18 +50,13 @@ def read_source(spec: SourceSpec,
                                      *spec.metric_columns, ANOMALY, INTERVAL]), report
 
     timestamps, bad_time = _parse_timestamps(raw[spec.timestamp_column])
-    labels = raw[list(spec.label_columns)].copy()
-    labels = labels.apply(lambda col: col.astype("string").str.strip())
-    bad_labels = int(labels.isna().any(axis=1).sum())
-    metrics = pd.DataFrame(index=raw.index)
-    bad_metrics = 0
-    for column in spec.metric_columns:
-        converted = pd.to_numeric(raw[column], errors="coerce")
-        bad_metrics += int((raw[column].notna() & converted.isna()).sum())
-        metrics[column] = converted.astype("float64")
+    labels = _coerce_labels(raw, spec.label_columns)
+    bad_labels = int(pd.isna(labels).any(axis=1).sum())
+    metrics, bad_metrics = _coerce_metrics(raw, spec.metric_columns)
     frame = pd.DataFrame({TIMESTAMP: timestamps})
     for column in spec.label_columns:
-        frame[column] = labels[column].astype(object)
+        # 标签统一成字符串；保留 object dtype 以维持既有 Parquet 序列化字节布局。
+        frame[column] = labels[column].astype("object")
     for column in spec.metric_columns:
         frame[column] = metrics[column]
     report.type_errors = int(bad_time + bad_labels + bad_metrics)
@@ -63,7 +66,7 @@ def read_source(spec: SourceSpec,
         report.issues.append(f"警告: {bad_labels} 行标签为空，已剔除")
     if bad_metrics:
         report.issues.append(f"提示: {bad_metrics} 个指标值无法转为数字，已置空")
-    frame = frame[frame[TIMESTAMP].notna()].copy()
+    frame = frame[pd.notna(frame[TIMESTAMP])].copy()
     if spec.label_columns:
         frame = frame.dropna(subset=list(spec.label_columns))
 
@@ -96,12 +99,26 @@ def read_source(spec: SourceSpec,
 
 
 def _read_raw(spec: SourceSpec) -> pd.DataFrame:
+    """按格式读取原始数据，并在读取边界显式声明列 dtype。
+
+    时间戳列不在此处理 dtype：它可能是数值 epoch、文本或带时区的 datetime，
+    统一交给 ``_parse_timestamps`` 归一化，避免推断导致的 object 退化。
+    """
     path = Path(spec.path)
+    labels = list(spec.label_columns)
+    metrics = list(spec.metric_columns)
     try:
         if spec.fmt == "parquet":
-            return pd.read_parquet(path)
+            # pandas 2.3 的 read_parquet 不支持 dtype 参数，先按文件内 schema 读，
+            # 再对声明列做显式 astype，杜绝依赖推断的隐式类型。
+            frame = pd.read_parquet(path, engine="pyarrow")
+            return _enforce_declared_dtypes(frame, labels, metrics)
         if spec.fmt == "csv":
-            return pd.read_csv(path)
+            # 标签与指标全部按字符串读入，指标再经 _coerce_metrics 显式转 float64；
+            # 这样脏值（如 "bad-number"）以类型错误计数而不是让解析直接失败。
+            dtype_map = {column: "string" for column in [*labels, *metrics]}
+            frame = _read_csv_with_dtype(path, dtype_map)
+            return _enforce_declared_dtypes(frame, labels, metrics)
         if spec.fmt == "sqlite":
             if not spec.table or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.table):
                 raise DataSourceError("SQLite 数据源必须提供合法表名（字母或下划线开头）")
@@ -109,9 +126,11 @@ def _read_raw(spec: SourceSpec) -> pd.DataFrame:
             connection = sqlite3.connect(uri, uri=True)
             try:
                 connection.execute("PRAGMA query_only=ON")
-                return pd.read_sql_query(f'SELECT * FROM "{spec.table}"', connection)
+                dtype_map = {column: "string" for column in [*labels, *metrics]}
+                frame = _read_sql_with_dtype(connection, spec.table, dtype_map)
             finally:
                 connection.close()
+            return _enforce_declared_dtypes(frame, labels, metrics)
     except DataSourceError:
         raise
     except (OSError, ValueError, sqlite3.Error) as exc:
@@ -119,17 +138,107 @@ def _read_raw(spec: SourceSpec) -> pd.DataFrame:
     raise DataSourceError(f"不支持的数据源格式: {spec.fmt}")
 
 
+def _read_csv_with_dtype(path: Path, dtype_map: Dict[str, str]) -> pd.DataFrame:
+    """按显式 dtype 映射读 CSV；映射中的列缺失时回退到默认读取。
+
+    回退后不在读取器层报错，让上层统一的“数据源缺少字段”校验抛 DataSourceError，
+    保持与历史版本一致的错误类型与提示。
+    """
+    try:
+        return pd.read_csv(path, dtype=dtype_map, keep_default_na=True,
+                           na_values=[""], encoding="utf-8")
+    except KeyError:
+        return pd.read_csv(path, keep_default_na=True, na_values=[""], encoding="utf-8")
+
+
+def _read_sql_with_dtype(connection: sqlite3.Connection, table: str,
+                         dtype_map: Dict[str, str]) -> pd.DataFrame:
+    """按显式 dtype 映射执行只读 SQL；映射中的列缺失时回退到无映射查询。"""
+    query = f'SELECT * FROM "{table}"'
+    try:
+        return pd.read_sql_query(query, connection, dtype=dtype_map)
+    except KeyError:
+        return pd.read_sql_query(query, connection)
+
+
+def _enforce_declared_dtypes(frame: pd.DataFrame, labels: List[str],
+                             metrics: List[str]) -> pd.DataFrame:
+    """对声明的标签/指标列显式固定 dtype，不依赖任何读取器推断。"""
+    for column in labels:
+        if column in frame.columns:
+            frame[column] = frame[column].astype("string")
+    for column in metrics:
+        if column in frame.columns:
+            # StringDtype 承载原始文本，数值化在 _coerce_metrics 中统一完成，
+            # 保证脏值可被识别且最终列类型恒为 float64。
+            frame[column] = frame[column].astype("string")
+    return frame
+
+
+def _coerce_labels(raw: pd.DataFrame, label_columns: List[str]) -> pd.DataFrame:
+    """标签列显式转字符串并去空白；空标签统一表现为 pd.NA。"""
+    labels = raw[list(label_columns)].copy()
+    for column in label_columns:
+        labels[column] = labels[column].astype("string").str.strip()
+    return labels
+
+
+def _coerce_metrics(raw: pd.DataFrame,
+                    metric_columns: List[str]) -> Tuple[pd.DataFrame, int]:
+    """指标列显式转 float64，返回转换后的帧与无法转数字的坏值计数。"""
+    metrics = pd.DataFrame(index=raw.index)
+    bad_metrics = 0
+    for column in metric_columns:
+        original = raw[column]
+        converted = pd.to_numeric(original, errors="coerce")
+        # 原始非空、转换后为空，即真正的坏值；pd.isna 同时覆盖 NaN 与 pd.NA。
+        bad_metrics += int((pd.notna(original) & pd.isna(converted)).sum())
+        metrics[column] = converted.astype("float64")
+    return metrics, bad_metrics
+
+
 def _parse_timestamps(series: pd.Series) -> Tuple[pd.Series, int]:
-    if pd.api.types.is_numeric_dtype(series) and series.notna().any():
-        magnitude = series.dropna().abs().median()
+    """把任意形态的时间戳列归一化为时区无关的 UTC ``datetime64[ns]``。
+
+    - 数值列或纯数值文本按 epoch（秒/毫秒）解析，量级自动判别。
+    - 其余文本/日期时间用 pandas 2.x 推荐的 ``format="mixed"`` 显式解析，
+      不再依赖被废弃的逐元素 infer 行为；统一 ``utc=True`` 先转成时区感知，
+      再 ``tz_convert(None)`` 去掉时区，输出确定的 UTC 墙上时间。
+    """
+    numeric = _as_numeric_epoch(series)
+    if numeric is not None:
+        magnitude = numeric.dropna().abs().median()
         unit = "ms" if magnitude > 1e11 else "s"
-        parsed = pd.to_datetime(series, unit=unit, errors="coerce", utc=True)
+        parsed = pd.to_datetime(numeric, unit=unit, errors="coerce", utc=True)
     else:
-        parsed = pd.to_datetime(series, errors="coerce", utc=True)
-    bad = int(parsed.isna().sum())
+        parsed = pd.to_datetime(series, format="mixed", errors="coerce", utc=True)
+    bad = int(pd.isna(parsed).sum())
     if getattr(parsed.dt, "tz", None) is not None:
         parsed = parsed.dt.tz_convert(None)
+    # 不强制单位：保留 pandas 2.x 默认的时间分辨率（us），
+    # 与历史归档产物的 Parquet 时间类型逐字节对齐。
     return parsed, bad
+
+
+def _as_numeric_epoch(series: pd.Series) -> Optional[pd.Series]:
+    """识别 epoch 输入：原生数值列直接返回；纯数值文本列转数值后返回。
+
+    文本列只有在“所有非空值都能解析成数字”时才走 epoch 分支；只要混入了
+    日期字符串等非数值内容，就返回 None 交给 ``mixed`` 日期时间解析，避免
+    把普通时间戳误判成 epoch。无法识别时返回 None。
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        return series
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return None
+    if not pd.notna(series).any():
+        return None
+    candidate = pd.to_numeric(series, errors="coerce")
+    # 非空原始值的位置上，数值化结果也必须全部非空，即整列都是数字文本。
+    original_present = pd.notna(series)
+    if bool(original_present.any()) and bool(pd.isna(candidate[original_present]).sum() == 0):
+        return candidate
+    return None
 
 
 def _infer_interval(frame: pd.DataFrame, labels) -> float:
@@ -145,6 +254,11 @@ def _infer_interval(frame: pd.DataFrame, labels) -> float:
 
 
 def _missing_slots(frame: pd.DataFrame, labels, interval: float) -> int:
+    """按标签分组估算缺失时间槽位。
+
+    所有空值判断统一使用 ``pandas.isna`` / ``notna``，对 NaN、pd.NA、None、
+    NaT 行为一致，不使用对 pd.NA 会抛错或语义不一致的 ``== None`` 比较。
+    """
     labels = list(labels)
     if interval <= 0 or frame.empty:
         return 0
