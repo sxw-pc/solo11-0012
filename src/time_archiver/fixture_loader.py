@@ -5,8 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .config_loader import PROJECT_ROOT
-from .schema import DataSourceError, SourceSpec
+from .config_loader import PROJECT_ROOT, load_yaml
+from .schema import ConfigError, DataSourceError, SourceSpec
 
 FIXTURE_DIR = PROJECT_ROOT / "fixtures" / "mock_sensor"
 MANIFEST_PATH = PROJECT_ROOT / "fixtures" / "demo_manifest.json"
@@ -73,3 +73,25 @@ def find_demo_source(source_id: str) -> SourceSpec:
         if spec.source_id == source_id:
             return spec
     raise DataSourceError(f"未知演示数据源: {source_id}")
+
+
+def load_source_manifest(path: Path) -> List[SourceSpec]:
+    """从 YAML 清单构造批量数据源，供 run-batch 使用。"""
+    data = load_yaml(Path(path))
+    raw = data.get("sources")
+    if not isinstance(raw, list) or not raw:
+        raise ConfigError("数据源清单必须包含非空 sources 列表")
+    specs: List[SourceSpec] = []
+    for position, item in enumerate(raw):
+        if not isinstance(item, dict) or not item.get("path"):
+            raise ConfigError(f"sources[{position}]: 必须是包含 path 的映射")
+        specs.append(SourceSpec(
+            path=Path(item["path"]),
+            fmt=str(item.get("format", "parquet")),
+            timestamp_column=str(item.get("timestamp_column", "timestamp")),
+            label_columns=tuple(item.get("label_columns") or ("sensor_id",)),
+            metric_columns=tuple(item.get("metric_columns") or ("value",)),
+            table=item.get("table"),
+            source_id=str(item.get("source_id", "")),
+        ))
+    return specs

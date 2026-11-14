@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "time-archiver"
-version = "1.0.0"
+version = "1.1.0"
 description = "时档匠：纯本地离线的时序数据分层降质归档工具"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -87,11 +87,14 @@ def run_task():
                 label_columns=columns("label_columns") or ("sensor_id",),
                 metric_columns=columns("metric_columns") or ("value",),
                 source_id=request.form.get("source_id", "").strip())]
-        for spec in specs:
-            try:
-                results.append(archiver.run_source(spec, actor="WEB"))
-            except Exception as exc:  # 单个源失败不阻断其余源
-                errors.append(f"{spec.source_id}: {exc}")
+        batch = archiver.run_batch(specs, actor="WEB")
+        for item in batch["results"]:
+            if item["status"] == "rejected":
+                errors.append(f"{item['source']}: 准入拒绝：{item['reason']}")
+            elif item["status"] == "failed":
+                errors.append(f"{item['source']}: {item.get('error', '归档失败')}")
+            else:
+                results.append(item)
     except Exception as exc:
         errors.append(str(exc))
     store = store_for(current_app)

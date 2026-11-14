@@ -7,7 +7,7 @@ from typing import Optional
 from flask import Flask, jsonify
 
 from ..archiver import Archiver
-from ..config_loader import init_workspace, load_policy
+from ..config_loader import init_workspace, load_budget, load_policy
 from ..fixture_loader import fixture_summary
 from ..metadata_store import MetadataStore
 from ..schema import ConfigError
@@ -19,7 +19,7 @@ def create_app(workdir: Path,
     workdir = Path(workdir).resolve()
     policy_file = init_workspace(workdir, policy_path)
     policy = load_policy(policy_file, workdir)
-    archiver = Archiver(workdir, policy)
+    archiver = Archiver(workdir, policy, budget=load_budget(workdir))
     app = Flask(__name__, template_folder="templates", static_folder="static")
     app.config.update(TESTING=testing, BIND_HOST="127.0.0.1",
                       WORKDIR=str(workdir), POLICY_FILE=str(policy_file))
@@ -68,7 +68,7 @@ def refresh_policy(app: Flask) -> None:
     policy = load_policy(policy_file, workdir)
     app.extensions["time_archiver"].update({
         "policy": policy,
-        "archiver": Archiver(workdir, policy),
+        "archiver": Archiver(workdir, policy, budget=load_budget(workdir)),
         "store": MetadataStore(workdir / "state" / "archive.db"),
     })
 

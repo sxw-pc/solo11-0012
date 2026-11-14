@@ -125,6 +125,22 @@ class Policy:
         }
 
 
+@dataclass(frozen=True)
+class Budget:
+    """准入与资源预算配置；独立于策略，不参与策略哈希与任务标识。"""
+
+    max_inflight_bytes: int
+    safety_factor: float = 1.5
+    history_reference: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "max_inflight_bytes": self.max_inflight_bytes,
+            "safety_factor": self.safety_factor,
+            "history_reference": self.history_reference,
+        }
+
+
 @dataclass
 class QualityReport:
     source_id: str

@@ -260,6 +260,14 @@ class MetadataStore:
                                        (row["shard_id"],))
         return changed
 
+    def tier_actual_rows(self, source: str, tier: str) -> int:
+        """同源同层活跃分片的实际行数合计，供准入预估做历史参照。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(row_count), 0) AS total FROM shards "
+                "WHERE source=? AND tier=? AND active=1", (source, tier)).fetchone()
+        return int(row["total"]) if row else 0
+
     def counts(self) -> Dict[str, int]:
         with self._connect() as connection:
             return {

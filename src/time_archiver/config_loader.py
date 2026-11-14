@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 import yaml
 
 from .schema import (
-    AGGREGATORS, GAP_STRATEGIES, SUPPORTED_FORMATS, ConfigError, Policy,
+    AGGREGATORS, GAP_STRATEGIES, SUPPORTED_FORMATS, Budget, ConfigError, Policy,
     PolicyTier, parse_granularity,
 )
 
@@ -22,6 +22,8 @@ TIER_KEYS = {
     "name", "granularity", "retention_days", "path", "format",
     "compression", "aggregations", "gap_strategy",
 }
+BUDGET_FILENAME = "budget.yaml"
+BUDGET_KEYS = {"version", "max_inflight_bytes", "safety_factor", "history_reference"}
 COMPRESSIONS = {
     "parquet": {"zstd", "snappy", "gzip", "none"},
     "csv": {"none", "gzip"},
@@ -196,6 +198,43 @@ def _validate_paths(tiers: list[PolicyTier], workdir: Path) -> list[str]:
         except OSError as exc:
             errors.append(f"tiers[{index}].path: 路径不可写: {exc}")
     return errors
+
+
+def load_budget(workdir: Path) -> Optional[Budget]:
+    """加载工作目录中的 budget.yaml；文件缺失时返回 None（准入关闭）。
+
+    预算配置独立于策略文件，不参与策略哈希与任务标识，因此开关或调整
+    预算不会让既有任务缓存失效。字段非法时一次性汇总为字段级错误。
+    """
+    path = Path(workdir) / BUDGET_FILENAME
+    if not path.exists():
+        return None
+    data = load_yaml(path)
+    errors: list[str] = []
+    unknown = sorted(set(data) - BUDGET_KEYS)
+    if unknown:
+        errors.append(f"预算字段未知: {', '.join(unknown)}")
+    version = data.get("version", 1)
+    if version != 1:
+        errors.append("version: 当前仅支持整数 1")
+    max_inflight = data.get("max_inflight_bytes")
+    if (isinstance(max_inflight, bool) or not isinstance(max_inflight, int)
+            or max_inflight <= 0):
+        errors.append("max_inflight_bytes: 必须是正整数（字节）")
+        max_inflight = 0
+    factor = data.get("safety_factor", 1.5)
+    if (isinstance(factor, bool) or not isinstance(factor, (int, float))
+            or not 1.0 <= float(factor) <= 10.0):
+        errors.append("safety_factor: 必须是 1.0 至 10.0 之间的数字")
+        factor = 1.5
+    history = data.get("history_reference", True)
+    if not isinstance(history, bool):
+        errors.append("history_reference: 必须是布尔值")
+        history = True
+    if errors:
+        raise ConfigError(errors)
+    return Budget(max_inflight_bytes=int(max_inflight),
+                  safety_factor=float(factor), history_reference=bool(history))
 
 
 def policy_to_yaml(policy: Policy) -> str:

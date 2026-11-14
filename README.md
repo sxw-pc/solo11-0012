@@ -100,6 +100,27 @@ python -m pytest
 
 审计日志采用 JSONL 追加写，每条记录包含序号、时间、操作、执行来源、任务标识、范围、输入哈希、输出哈希、结果、错误与详情。每条记录的 `prev_hash` 指向上一条记录的 `entry_hash`，首条记录的前序哈希为空串。修改任何历史字段都会使后续哈希链校验失败。审计导出支持 JSON 与 Markdown。
 
+### 4.9 准入与资源预算（可选）
+
+边缘网关在一个调度窗口里往往会同时收到多个数据源的归档请求。直接全量开工时，输入特别大或某层降采样后行数暴涨的源可能把内存顶满，导致整批任务失败重来。时档匠提供可选的**准入与资源预算**环节：在真正开始逐层降采样之前，先对每个源做确定性成本预估，再按预估成本和可配置的总预算决定这一批源哪些先跑、哪些排队、哪些直接拒绝。
+
+启用方式是在工作目录放置 `budget.yaml`（可参考 `config/example_budget.yaml`）：
+
+```yaml
+version: 1
+max_inflight_bytes: 268435456  # 准入总预算（字节）：已准入但未释放的预估峰值内存上限
+safety_factor: 1.5             # 预估安全系数：逐层桶数递推结果统一乘该系数
+history_reference: true        # 是否把已有分片的实际行数作为预估下界参照
+```
+
+**预估模型**：读取源数据后，按与分层链路完全一致的年龄窗口逐层递推——每层先算出“标签组合数 × 每桶标签组合桶数（⌊选中时间跨度 ÷ 层粒度⌋ + 1）”的桶网格；`skip` 策略的输出行数上界取 `min(网格, 选中行数)`，`null`/`ffill` 补桶策略取全网格；开启历史参照时再与同源同层活跃分片的实际行数合计取大者，最后统一乘安全系数。峰值内存按“源数据帧常驻 + 各层瞬时占用（选中副本、聚合输出、最大分片序列化缓冲）的最大值”估算。预估只依赖源数据统计、策略参数和安全系数，**不读取当前时钟**，同一份输入在同一工作目录状态下重复预估得到逐字节一致的结果。
+
+**预算语义**：`max_inflight_bytes` 是同一调度窗口内“已准入但尚未释放”的预估峰值内存上限。批量入口（`run-batch`、`demo`、`schedule`、Web 运行）按预估成本升序准入：预估超过总预算的源直接拒绝并给出可读原因；其余源依次准入并占用预算，完成或失败都立即释放，排队源在每次释放后按余量提拔。准入通过后才进入原有分层遍历与两阶段提交链路；被拒绝的源只落一条 `admission`（`rejected`）审计记录，不产生任务记录和任何分片。
+
+**审计与校准**：每次准入、拒绝、释放都写入哈希链审计。准入与拒绝记录携带完整预估明细；释放记录同时携带预估与实际落盘的行数、分片数、输出字节和进程峰值内存（尽力而为），方便事后对照校准安全系数。批次末尾写一条 `summary` 记录汇总本窗口的准入、排队、拒绝与执行顺序。
+
+**兼容性**：`budget.yaml` 独立于策略文件，不参与策略哈希与任务标识，因此开关或调整预算不会让既有任务缓存失效。不配置预算时所有入口行为与未启用预算完全一致，旧工作目录无需任何改动。预算判定只读查询已有分片的实际行数作为参照，不会因此重算已完成的源；已完成且输出完整的任务仍然直接命中缓存，不进入预估与准入流程。
+
 ## 五、配置详解
 
 默认策略位于 `config/default_policy.yaml`，示例策略位于 `config/example_policies/`。以下是一个最小可运行示例：
@@ -164,6 +185,7 @@ tiers:
 | `load-demo` | 校验并列出三组内置演示数据 |
 | `validate-config` | 校验策略字段、粒度、保留周期和路径 |
 | `archive` | 对单个 Parquet、CSV 或 SQLite 源执行分层归档 |
+| `run-batch` | 按准入预算批量归档一批数据源（清单或内置演示数据） |
 | `demo` | 一键跑通加载、归档、索引、检索、恢复与审计验证 |
 | `schedule` | 在本进程内按固定间隔重复归档演示数据 |
 | `tasks` | 查询任务状态、阶段、质量和输出信息 |
@@ -185,6 +207,31 @@ time-archiver --workdir demo_work archive --source ./data/metrics.parquet \
 ```
 
 SQLite 输入默认只读打开，需通过 `--table` 指定表名。CSV 输入使用 UTF-8 文本。时间列支持常见日期时间字符串、Unix 秒和毫秒时间戳；解析失败的行会被计入类型错误，严重质量问题时任务失败且不会写入正式索引。
+
+批量归档示例（需先在工作目录配置 `budget.yaml`，或用 `--budget-bytes` 临时指定总预算）：
+
+```bash
+time-archiver --workdir demo_work run-batch --manifest sources.yaml
+time-archiver --workdir demo_work run-batch --budget-bytes 268435456 --safety-factor 1.5
+```
+
+`--manifest` 指向一份 YAML 数据源清单，缺省时使用内置演示数据。清单格式：
+
+```yaml
+sources:
+  - path: /data/edge-a.parquet
+    format: parquet
+    timestamp_column: timestamp
+    label_columns: [sensor_id, metric_group]
+    metric_columns: [temperature, humidity]
+    source_id: edge-a
+  - path: /data/iot-b.csv
+    format: csv
+    metric_columns: [value]
+    source_id: iot-b
+```
+
+命令输出每个源的处置结果（`completed`/`failed`/`rejected`/`cached`）、是否经历过排队、预估峰值和拒绝原因；`archive` 单源命令在配置了预算时同样先过准入，被拒绝时以非零码退出并输出原因。
 
 检索示例：
 

@@ -41,7 +41,15 @@ def archive_cmd(ctx, source_path, fmt, timestamp_column, label_columns,
                       tuple(filter(None, label_columns.split(","))),
                       tuple(filter(None, metric_columns.split(","))), table, source_id)
     try:
-        emit(archiver.run_source(spec))
+        if archiver.budget is None:
+            emit(archiver.run_source(spec))
+            return
+        result = archiver.run_batch([spec])["results"][0]
+        if result["status"] == "rejected":
+            raise click.ClickException(result["reason"])
+        if result["status"] == "failed":
+            raise click.ClickException(result.get("error", "归档失败"))
+        emit(result)
     except (DataSourceError, ArchiveError, ConfigError) as exc:
         raise click.ClickException(str(exc))
 
