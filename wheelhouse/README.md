@@ -19,6 +19,14 @@ python -m pip install --no-index --no-build-isolation \
 
 `--no-index` 禁止 pip 访问包索引，`--find-links wheelhouse` 只使用本目录中的文件。`--no-build-isolation` 让项目构建复用已经安装的 setuptools，避免构建阶段尝试联网。`editable_mode=compat` 用于绕开部分 setuptools 版本在可编辑构建时报告元数据目录为空的问题。
 
+安装前可先运行部署自检。它会扫描本目录的 wheel 文件名标签（Python、ABI、平台）与 wheel 内 `METADATA` 的 `Requires-Dist`，对 `requirements.txt` 做完整依赖闭包解析，并明确指出缺失的依赖或不兼容的轮子：
+
+```bash
+time-archiver --workdir demo_work preflight --strict
+```
+
+严格模式下，只要任一依赖在当前解释器上无法由本目录满足，自检会以非零退出码结束，而不会等到归档执行中途才失败。若本目录与目标平台不匹配（例如在 Linux 上使用 Windows 轮子），该检查会直接列出这些轮子及其标签。
+
 ## 其他平台的准备方式
 
 轮子与平台和 Python 小版本相关。若部署目标是 Linux、macOS 或不同的 Python 版本，需要在一台可联网的准备机上执行与目标平台对应的下载命令，再将整个 `wheelhouse` 复制到离线机器。准备阶段可以联网，归档工具运行阶段不会联网。

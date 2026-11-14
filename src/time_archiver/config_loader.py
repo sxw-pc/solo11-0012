@@ -50,8 +50,13 @@ def load_yaml(path: Path) -> Dict[str, Any]:
     return data
 
 
-def load_policy(path: Path, workdir: Optional[Path] = None) -> Policy:
-    """加载并严格校验策略；错误一次性汇总为字段级信息。"""
+def load_policy(path: Path, workdir: Optional[Path] = None,
+                probe_write: bool = True) -> Policy:
+    """加载并严格校验策略；错误一次性汇总为字段级信息。
+
+    ``probe_write=False`` 用于部署自检等只读场景：仍会校验路径是否在
+    工作目录内以及最近的已存在祖先是否可写，但不会创建目录或探测文件。
+    """
     data = load_yaml(Path(path))
     errors: list[str] = []
     unknown = sorted(set(data) - TOP_KEYS)
@@ -167,27 +172,41 @@ def load_policy(path: Path, workdir: Optional[Path] = None) -> Policy:
             if valid_days[index] <= valid_days[index - 1]:
                 errors.append(f"tiers[{index}].retention_days: 保留周期必须严格递增")
     if workdir is not None:
-        errors.extend(_validate_paths(tiers, Path(workdir)))
+        errors.extend(_validate_paths(tiers, Path(workdir),
+                                      probe_write=probe_write))
     if errors:
         raise ConfigError(errors)
     return Policy(name=name, tiers=tuple(tiers), version=version,
                   reference=reference, quality=quality, raw=data)
 
 
-def _validate_paths(tiers: list[PolicyTier], workdir: Path) -> list[str]:
-    """在真实文件系统上验证路径可写且不越界。"""
+def _validate_paths(tiers: list[PolicyTier], workdir: Path,
+                    probe_write: bool = True) -> list[str]:
+    """在真实文件系统上验证路径可写且不越界。
+
+    ``probe_write=False`` 时不创建目录、不写探测文件，只确认解析后的路径
+    没有越界，并检查已存在的最近祖先目录是否可写。
+    """
     errors: list[str] = []
     base = workdir.resolve()
-    try:
-        workdir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return [f"workdir: 无法创建工作目录: {exc}"]
+    if probe_write:
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return [f"workdir: 无法创建工作目录: {exc}"]
     for index, tier in enumerate(tiers):
         target = (workdir / tier.path).resolve()
         try:
             target.relative_to(base)
         except ValueError:
             errors.append(f"tiers[{index}].path: 解析后越出工作目录")
+            continue
+        if not probe_write:
+            ancestor = target
+            while not ancestor.exists() and ancestor != ancestor.parent:
+                ancestor = ancestor.parent
+            if not os.access(ancestor, os.W_OK):
+                errors.append(f"tiers[{index}].path: 最近的可写祖先不可写: {ancestor}")
             continue
         try:
             target.mkdir(parents=True, exist_ok=True)

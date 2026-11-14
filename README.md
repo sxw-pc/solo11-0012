@@ -27,20 +27,21 @@
 
 ## 三、快速开始
 
-在项目根目录准备 Python 3.9～3.11 环境，然后依次执行以下四条命令：
+在项目根目录准备 Python 3.9～3.11 环境，然后依次执行以下五条命令：
 
 ```bash
 python -m pip install --no-index --find-links wheelhouse setuptools wheel -r requirements.txt
 python -m pip install --no-index --no-build-isolation --config-settings editable_mode=compat -e .
+time-archiver --workdir demo_work preflight --strict
 time-archiver --workdir demo_work demo
 python -m pytest
 ```
 
-第一条命令完全从本地 `wheelhouse` 安装依赖，不访问网络。第二条命令以可编辑方式安装本项目，并生成 `time-archiver` 命令；`editable_mode=compat` 用于绕开部分 setuptools 版本在可编辑构建时报告元数据目录为空的问题。第三条命令自动初始化 `demo_work`、加载三组内置 mock 数据、执行全量分层归档、构建索引、检索并恢复一个样本。第四条命令运行全量测试并输出覆盖率报告。
+第一条命令完全从本地 `wheelhouse` 安装依赖，不访问网络。第二条命令以可编辑方式安装本项目，并生成 `time-archiver` 命令；`editable_mode=compat` 用于绕开部分 setuptools 版本在可编辑构建时报告元数据目录为空的问题。第三条是部署自检：在真正归档前确认离线依赖、策略配置、工作目录、元数据库和既有分片指纹都可用，`--strict` 下任一项不通过即以非零码退出。第四条命令初始化 `demo_work`、加载三组内置 mock 数据、执行全量分层归档、构建索引、检索并恢复一个样本。第五条命令运行全量测试并输出覆盖率报告。
 
 如果不想安装项目，也可以在项目根目录使用源码方式运行。Windows PowerShell 可先执行 `$env:PYTHONPATH="src"`，Linux 或 macOS 可执行 `export PYTHONPATH=src`，随后运行 `python -m time_archiver --workdir demo_work demo`。测试配置已经声明 `pythonpath = src`，因此直接执行 `python -m pytest` 即可。若命令行未把 pip 的脚本目录加入 PATH，可使用 `python -m time_archiver` 代替 `time-archiver`。
 
-`wheelhouse` 中的二进制轮子按 Windows x86_64、CPython 3.11 准备。若目标机器是 Linux、macOS 或其他 Python 小版本，需要在**联网的准备阶段**使用相同依赖清单重新下载对应平台的轮子，再拷贝到离线机器；归档工具运行期间本身不会发起任何外部请求。具体说明见 `wheelhouse/README.md`。
+`wheelhouse` 中的二进制轮子按 Windows x86_64、CPython 3.11 准备。若目标机器是 Linux、macOS 或其他 Python 小版本，需要在**联网的准备阶段**使用相同依赖清单重新下载对应平台的轮子，再拷贝到离线机器；归档工具运行期间本身不会发起任何外部请求。`preflight` 会在归档前解析 wheelhouse 的完整依赖闭包（含传递依赖与版本下限），并明确报出缺失的轮子或 ABI/平台不兼容的轮子，避免等到归档跑到一半才发现环境不可用。具体说明见 `wheelhouse/README.md`。
 
 ## 四、核心概念
 
@@ -163,6 +164,7 @@ tiers:
 | `init` | 初始化工作目录、默认策略、审计与状态目录 |
 | `load-demo` | 校验并列出三组内置演示数据 |
 | `validate-config` | 校验策略字段、粒度、保留周期和路径 |
+| `preflight` | 只读部署自检：离线依赖、策略、工作目录、元数据库、分片指纹与残留 |
 | `archive` | 对单个 Parquet、CSV 或 SQLite 源执行分层归档 |
 | `demo` | 一键跑通加载、归档、索引、检索、恢复与审计验证 |
 | `schedule` | 在本进程内按固定间隔重复归档演示数据 |
@@ -208,6 +210,47 @@ time-archiver --workdir demo_work rollback --task-id <任务标识>
 
 回滚只会撤销分片指针与索引，不会删除归档包，也不会删除或修改任何原始输入。若没有更早版本可恢复，分片会标记为不活跃，归档包仍然留在磁盘上供人工核查。
 
+### 6.1 部署自检
+
+```bash
+# 严格模式：任一检查不通过即拒绝后续归档，退出码非零
+time-archiver --workdir demo_work preflight --strict
+
+# 非严格模式：只记录警告并继续，退出码为 0
+time-archiver --workdir demo_work preflight
+
+# 归档前先自检；--strict 下自检失败会直接阻断本次归档
+time-archiver --workdir demo_work archive \
+  --source ./data/metrics.parquet --preflight --strict
+```
+
+自检覆盖六类事实，并全部以结构化 JSON 输出：
+
+| 检查 | 内容 | 失败后果 |
+| --- | --- | --- |
+| `dependencies` | 解析 `requirements.txt` 的完整依赖闭包，确认每个依赖在 wheelhouse 中都有当前解释器可用的版本，并满足版本下限 | 严格模式拒绝归档 |
+| `config` | 校验工作目录策略、`config/default_policy.yaml` 与 `config/example_policies/*.yaml`，逐份给出字段级错误 | 严格模式拒绝归档 |
+| `workdir` | 工作目录及 `state/audit/staging/archives` 子目录可写 | 严格模式拒绝归档 |
+| `metadata` | 既有 `state/archive.db` 能以只读方式打开、通过 `integrity_check`、包含预期表 | 严格模式拒绝归档 |
+| `shard_fingerprints` | 既有分片文件名中的 10 位内容指纹与文件实际 SHA256 一致；元数据库记录的 SHA256 也一致 | 严格模式拒绝归档 |
+| `residue` | staging 临时文件、原子写临时文件、失败或中断任务 | 仅为警告，不阻断 |
+
+自检本身只读：不初始化工作目录、不复制策略、不创建元数据库，唯一写入是审计日志。连续两次同参数自检，除审计日志外不会新增或改动任何文件，且审计中的 `report_id` 完全一致。
+
+自检结果作为独立操作类型 `preflight` 追加到同一条哈希链审计（复用现有 `AuditLog.log` 入口，保证哈希链单链完整），但不会创建元数据库任务行，因此不会占用正式归档任务的序号或任务标识。
+
+工作目录中已经存在的 staging 临时文件或上次失败任务的残留会被标记为“待清理”状态（`residue` 检查为 `warn`），而不是直接判失败。需要清理时使用 `--cleanup`：自检会把残留文件移入 `state/preflight_quarantine/q-<摘要>/` 并写下含 SHA256 的清单，任何移动都可回退：
+
+```bash
+# 清理并生成隔离清单
+time-archiver --workdir demo_work preflight --cleanup
+
+# 按最近一份清单恢复，或指定具体 manifest.json
+time-archiver --workdir demo_work preflight --restore-cleanup latest
+```
+
+恢复动作只把仍不存在于原路径的文件移回，拒绝覆盖已存在的目标，也会校验隔离文件的 SHA256。失败或中断任务行不会在清理时被改写，由下一次归档自然覆盖。
+
 ## 七、Web 本地控制台
 
 启动命令：
@@ -248,11 +291,12 @@ Web 测试通过 Flask 测试客户端完成，不监听真实端口，不产生
 - 归档包序列化、确定性 tar.gz、索引偏移、包校验、定点提取、损坏包处理。
 - 元数据表、分片历史、索引替换、回滚指针恢复。
 - 审计字段完整性、筛选、哈希链篡改检测、双格式导出。
+- 部署自检：依赖闭包解析、wheel ABI/平台匹配、配置逐文件定位、工作目录与元数据库、分片指纹篡改定位、残留清理与回退、审计幂等。
 - CLI 全命令链路与错误路径，Web 页面、策略编辑、任务触发、检索、下载和导出。
 - 网络完全阻断时归档和 Web 页面仍可工作。
 - 空数据、单行数据、只有标签、无异常列、非法时间、单层级策略、空层级、未完成任务回滚等边界。
 
-最近一次完整测试结果为 123 项通过，整体语句覆盖率为 95%。核心模块覆盖率：降采样 100%，归档 99%，索引构建 99%，元数据存储 97%。执行 `python -m pytest` 会自动启用覆盖率门槛，整体低于 85% 时测试命令返回失败。
+最近一次完整测试结果为 168 项通过，整体语句覆盖率为 93%。核心模块覆盖率：降采样 100%，归档 99%，索引构建 99%，元数据存储 97%，部署自检 90%。执行 `python -m pytest` 会自动启用覆盖率门槛，整体低于 85% 时测试命令返回失败。
 
 ## 十、数据安全与操作边界
 
@@ -298,6 +342,7 @@ Web 测试通过 Flask 测试客户端完成，不监听真实端口，不产生
 ## 十二、已知边界
 
 - 不提供分布式任务协调，多个进程同时写同一工作目录时应由外部保证串行。
+- 依赖自检基于 wheel 文件名标签与 METADATA 的 `Requires-Dist` 做静态解析，不执行 pip 的完整解析器；复杂的 `===` 任意版本或环境标记仍按保守策略处理。
 - 不提供实时监控、告警、可视化大盘或采集代理。
 - 不支持对象存储、云数据库和远程传输。
 - 不提供自定义 Python 算子插件；聚合算子固定为七种内置实现。
