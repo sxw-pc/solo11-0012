@@ -189,6 +189,8 @@ class IndexEntry:
     tags: Dict[str, list]
     tier: str
     source: str
+    # 数据成员负载的 SHA256；历史归档包没有该字段时为空串，恢复时回退到整包哈希。
+    member_sha256: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)

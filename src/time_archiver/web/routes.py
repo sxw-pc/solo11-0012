@@ -152,6 +152,36 @@ def restore_archive():
     return send_file(target, as_attachment=True, download_name=target.name)
 
 
+@bp.post("/archive/restore-batch")
+def restore_batch():
+    """按时间范围与标签组合并发批量恢复，支持断点续跑，审计来源记为 WEB。"""
+    from ..restore import RestorePlanner, build_spec, parse_labels
+    store = store_for(current_app)
+    workdir = Path(current_app.config["WORKDIR"])
+    try:
+        start = _normalize_time(request.form.get("start", ""), end=False)
+        end = _normalize_time(request.form.get("end", ""), end=True)
+    except ValueError as exc:
+        return jsonify({"error": f"时间格式非法: {exc}"}), 400
+    raw_labels = request.form.getlist("label")
+    if request.form.get("label_key", "").strip():
+        raw_labels.append(
+            f"{request.form.get('label_key', '').strip()}="
+            f"{request.form.get('label_value', '').strip()}")
+    try:
+        labels = parse_labels(raw_labels)
+        try:
+            jobs = max(1, min(32, int(request.form.get("jobs", 1))))
+        except ValueError:
+            return jsonify({"error": "jobs 必须是整数"}), 400
+        spec = build_spec(start, end, labels)
+        planner = RestorePlanner(workdir, store, _archiver().audit, actor="WEB")
+        result = planner.run(spec, workdir / "restored", jobs=jobs, actor="WEB")
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result), (200 if result["status"] == "completed" else 409)
+
+
 @bp.get("/audit")
 def audit_page():
     audit = _archiver().audit

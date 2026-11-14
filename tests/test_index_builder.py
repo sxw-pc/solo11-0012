@@ -9,10 +9,12 @@ import pytest
 
 from time_archiver.index_builder import (
     atomic_write, build_archive_package, deserialize_frame,
-    entries_for_existing_package, extension_for, extract_member, read_package_index,
-    restore_by_entry, serialize_frame, verify_package, verify_serialized,
+    entries_for_existing_package, extension_for, extract_member,
+    member_hash_from_manifest, read_member_at_offset, read_package_index,
+    restore_by_entry, serialize_frame, verify_member_bytes, verify_package,
+    verify_serialized,
 )
-from time_archiver.schema import PolicyTier, bytes_sha256
+from time_archiver.schema import ArchiveError, PolicyTier, bytes_sha256
 
 @pytest.fixture
 def frame():
@@ -216,3 +218,50 @@ def test_directory_member_is_not_extractable(tmp_path):
     with pytest.raises(FileNotFoundError):
         extract_member(package, "data.parquet", tmp_path / "out")
     assert not verify_package(package)
+
+
+def test_member_sha256_recorded_in_index_and_manifest(frame, archive_tier, tmp_path):
+    package = tmp_path / "sample.tar.gz"
+    _digest, _size, entries = build_archive_package(
+        frame, package, archive_tier, ["sensor_id"], ["temperature"], "source")
+    entry = entries[0]
+    assert entry.member_sha256
+    manifest = read_package_index(package)
+    assert manifest["members"][0]["sha256"] == entry.member_sha256
+    rebuilt = entries_for_existing_package(package, "sample.tar.gz", "s1")
+    assert rebuilt[0].member_sha256 == entry.member_sha256
+    assert member_hash_from_manifest(package, entry.member_name) == entry.member_sha256
+
+
+def test_read_member_at_offset_matches_payload(frame, archive_tier, tmp_path):
+    package = tmp_path / "sample.tar.gz"
+    _digest, _size, entries = build_archive_package(
+        frame, package, archive_tier, ["sensor_id"], ["temperature"], "source")
+    entry = entries[0]
+    data = read_member_at_offset(package, entry.offset, entry.size)
+    assert bytes_sha256(data) == entry.member_sha256
+    short = tmp_path / "short.tar.gz"
+    short.write_bytes(package.read_bytes()[: len(package.read_bytes()) // 2])
+    with pytest.raises(ArchiveError, match="偏移读取"):
+        read_member_at_offset(short, entry.offset, entry.size)
+
+
+def test_verify_member_bytes_member_and_package_level(frame, archive_tier, tmp_path):
+    package = tmp_path / "sample.tar.gz"
+    _digest, _size, entries = build_archive_package(
+        frame, package, archive_tier, ["sensor_id"], ["temperature"], "source")
+    entry = entries[0].to_dict()
+    data = read_member_at_offset(package, entry["offset"], entry["size"])
+    verify_member_bytes(package, entry, data)  # 成员哈希匹配，不抛异常
+    with pytest.raises(ArchiveError, match="成员 sha256"):
+        verify_member_bytes(package, entry, b"tampered-payload")
+    # 旧条目没有成员哈希时回退整包哈希
+    legacy = dict(entry)
+    legacy["member_sha256"] = ""
+    legacy["package_sha256"] = bytes_sha256(package.read_bytes())
+    verify_member_bytes(package, legacy, data)
+    other = tmp_path / "other.tar.gz"
+    other.write_bytes(package.read_bytes())
+    legacy["package_sha256"] = "0" * 64
+    with pytest.raises(ArchiveError, match="整体 sha256"):
+        verify_member_bytes(other, legacy, data)

@@ -10,7 +10,10 @@ from pathlib import Path
 import click
 
 from .audit import AuditLog
-from .cli_commands import archive_cmd, audit_export_cmd, restore_cmd
+from .cli_commands import (
+    archive_cmd, audit_export_cmd, restore_batch_cmd, restore_cleanup_cmd,
+    restore_cmd,
+)
 from .cli_helpers import emit, runtime
 from .config_loader import init_workspace, load_policy
 from .fixture_loader import demo_sources, fixture_summary
@@ -178,6 +181,8 @@ def test_cmd(cov):
 
 cli.add_command(archive_cmd)
 cli.add_command(restore_cmd)
+cli.add_command(restore_batch_cmd)
+cli.add_command(restore_cleanup_cmd)
 cli.add_command(audit_export_cmd)
 
 

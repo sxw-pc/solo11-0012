@@ -102,3 +102,68 @@ def test_list_shards_and_counts(workdir: Path):
     assert [s["tier"] for s in store.list_shards(tier="hot")] == ["hot"]
     assert store.counts() == {"tasks": 0, "shards": 2, "archives": 0}
     assert store.shards_for_task("none") == []
+
+
+def test_legacy_schema_migrates_additively(workdir: Path):
+    import sqlite3
+    db_path = workdir / "state" / "legacy.db"
+    # 先按新结构写入数据，再手动回退成旧版表结构
+    store = MetadataStore(db_path)
+    store.save_shard(shard())
+    store.replace_index([entry()])
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        "CREATE TABLE old_idx AS SELECT id,shard_id,package_path,member_name,offset,"
+        "size,row_count,min_ts,max_ts,tags_json,tier,source FROM archive_index; "
+        "DROP TABLE archive_index; ALTER TABLE old_idx RENAME TO archive_index; "
+        "DROP TABLE restore_tasks; DROP TABLE restore_units;")
+    connection.commit()
+    connection.close()
+    # 重新打开应自动补列补表，且历史行不丢
+    migrated = MetadataStore(db_path)
+    rows = migrated.search()
+    assert len(rows) == 1
+    assert rows[0]["member_sha256"] == ""
+    spec = {"start": "", "end": "", "labels": []}
+    migrated.save_restore_task("restore-x", spec, "restored", 2, 3)
+    migrated.save_restore_unit("restore-x", 0, "pending", "archives/a.tar.gz", 1,
+                               {"data.parquet": "d"}, ["a.parquet"],
+                               str(workdir / "staging"))
+    units = migrated.list_restore_units("restore-x")
+    assert units[0]["member_sha256"] == {"data.parquet": "d"}
+    assert migrated.get_restore_task("restore-x")["total_units"] == 2
+    migrated.update_restore_task("restore-x", "completed")
+    assert migrated.get_restore_task("restore-x")["status"] == "completed"
+
+
+def test_search_members_multi_label_and(workdir: Path):
+    store = MetadataStore(workdir / "state" / "store.db")
+    store.save_shard(shard("s1", "t1", "archives/s1.tar.gz"))
+    store.save_shard(shard("s2", "t1", "archives/s2.tar.gz", digest="b" * 64))
+    first = entry(shard_id="s1", package_path="archives/s1.tar.gz")
+    second = IndexEntry("s2", "archives/s2.tar.gz", "data.parquet", 1024, 2048, 20,
+                        "2024-02-01T00:00:00Z", "2024-02-29T00:00:00Z",
+                        {"sensor_id": ["s-b"], "group": ["g2"]}, "archive", "source")
+    store.replace_index([first, second])
+    assert len(store.search_members(labels=[("sensor_id", "s-a")])) == 1
+    assert store.search_members(labels=[("sensor_id", "s-b"),
+                                        ("group", "g2")])[0]["shard_id"] == "s2"
+    assert store.search_members(labels=[("sensor_id", "s-b"),
+                                        ("group", "missing")]) == []
+    assert store.search_members(start="2024-02-01")[0]["package_sha256"] == "b" * 64
+
+
+def test_search_members_without_limit_never_truncates(workdir: Path):
+    store = MetadataStore(workdir / "state" / "store.db")
+    total = 25
+    for i in range(total):
+        sid = f"s-{i:02d}"
+        store.save_shard(shard(sid, "t1", f"archives/{sid}.tar.gz",
+                               digest=("a" * 63) + format(i, "x")))
+        store.replace_index([IndexEntry(
+            sid, f"archives/{sid}.tar.gz", "data.parquet", 0, 10, 1,
+            "2024-01-01T00:00:00Z", "2024-01-31T00:00:00Z",
+            {"sensor_id": [f"v{i}"]}, "archive", "source")])
+    # 默认交互查询有上限；批量恢复路径用 limit=None 必须取全量
+    assert len(store.search_members(limit=10)) == 10
+    assert len(store.search_members(limit=None)) == total

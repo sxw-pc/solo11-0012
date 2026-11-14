@@ -169,6 +169,8 @@ tiers:
 | `tasks` | 查询任务状态、阶段、质量和输出信息 |
 | `search` | 按时间范围与标签组合检索冷归档索引 |
 | `restore` | 按索引分片恢复，或从指定包定点提取成员 |
+| `restore-batch` | 按时间范围与多标签并发批量恢复，支持断点续跑与确定性输出 |
+| `restore-cleanup` | 显式回收批量恢复的 staging 残留（默认保护中断任务） |
 | `rollback` | 回滚最近或指定任务，归档包保留 |
 | `audit-export` | 导出 JSON 或 Markdown 审计日志 |
 | `web` | 启动仅绑定 127.0.0.1 的本地 Web 服务 |
@@ -199,6 +201,26 @@ time-archiver --workdir demo_work search \
 ```bash
 time-archiver --workdir demo_work restore --shard-id <分片标识> --out ./restored
 ```
+
+并发批量恢复示例（跨月、多标签、可中断续跑）：
+
+```bash
+time-archiver --workdir demo_work restore-batch \
+  --start 2024-01-01 --end 2024-03-31 \
+  --label sensor_id=sensor-a --label metric_group=env \
+  --jobs 4 --out ./restored
+```
+
+`restore-batch` 先从 `archive_index` 与包内 `index.json` 算出全部命中成员，按归档包与负载大小切成与并行度无关的恢复单元，再用 `--jobs`（简写 `-j`，缺省 `1`）个线程并行提取。每个单元使用 `staging/restore/<任务标识>/unit_<序号>/` 独立目录，按包内偏移定点读取并校验成员 SHA256，最后原子落盘到输出目录，并生成按 `min_ts`、成员名固定排序的 `restore_manifest.json`。
+
+该命令保证：
+
+- **确定性**：同一筛选条件下，无论 `--jobs` 取 1 还是更大值，输出文件集合、文件内容与恢复清单都逐字节一致；合并顺序永远按索引登记的 `min_ts` 与成员名，而非线程完成时间。
+- **断点续跑**：任务与单元状态写入元数据库。Ctrl-C 或掉电后重跑相同条件，已完成单元只做哈希复核即跳过、不重复读包；staging 残留先复核后复用。
+- **失败隔离**：单个成员哈希被篡改只使对应单元失败并记入审计，其它单元照常完成；任务整体标记为失败，修复后可从失败点继续。
+- **残留可控**：恢复流程不静默删除任何 staging 文件。`restore-cleanup` 默认只回收已完成/失败任务的残留并保护中断任务，加 `--all` 或 `--task-id` 才会强制清理。
+
+旧的 `restore` 命令签名、默认输出目录（`restored`）、输出文件名与单线程路径保持不变；不带并发参数的历史调用行为与升级前完全一致。旧版元数据库在首次打开时自动做只增不删的列/表迁移，历史数据与审计链不受影响。
 
 回滚示例：
 

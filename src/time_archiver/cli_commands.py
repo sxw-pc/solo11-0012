@@ -9,6 +9,9 @@ from .audit import AuditLog
 from .cli_helpers import emit, runtime
 from .config_loader import init_workspace
 from .index_builder import extract_member
+from .restore import (
+    RestorePlanner, build_spec, cleanup_staging, parse_labels,
+)
 from .schema import ArchiveError, ConfigError, DataSourceError, SourceSpec, file_sha256
 
 
@@ -78,6 +81,45 @@ def restore_cmd(ctx, shard_id, package, member, output_dir):
     audit.log("restore", "CLI", result="success", output_hashes=[file_sha256(target)],
               details={"package": str(package), "member": member})
     emit({"restored": str(target)})
+
+
+@click.command("restore-batch")
+@click.option("--start", default="", help="时间范围下界（UTC，含），支持日期或 ISO 时间")
+@click.option("--end", default="", help="时间范围上界（UTC，含），支持日期或 ISO 时间")
+@click.option("--label", "labels", multiple=True,
+              help="标签条件 key=value，可重复传入，多个条件按 AND 组合")
+@click.option("--jobs", "-j", "jobs", type=click.IntRange(min=1, max=32),
+              default=1, show_default=True,
+              help="并发恢复单元数；缺省为 1，与升级前单线程行为一致")
+@click.option("--out", "output_dir", type=click.Path(path_type=Path),
+              default=Path("restored"), show_default=True)
+@click.pass_context
+def restore_batch_cmd(ctx, start, end, labels, jobs, output_dir):
+    """按时间范围与标签组合并发批量恢复，支持断点续跑与确定性输出。"""
+    workdir = ctx.obj["workdir"]
+    _, archiver, store, audit = runtime(workdir)
+    try:
+        parsed_labels = parse_labels(labels)
+        spec = build_spec(start, end, parsed_labels)
+        planner = RestorePlanner(workdir, store, audit)
+        result = planner.run(spec, output_dir, jobs=jobs, actor="CLI")
+    except (ArchiveError, ConfigError) as exc:
+        raise click.ClickException(str(exc))
+    emit(result)
+    if result["status"] != "completed":
+        raise click.exceptions.Exit(code=2)
+
+
+@click.command("restore-cleanup")
+@click.option("--task-id", default="", help="仅清理指定恢复任务的 staging 残留")
+@click.option("--all", "remove_all", is_flag=True, default=False,
+              help="连同中断/运行中任务的残留一并清理")
+@click.pass_context
+def restore_cleanup_cmd(ctx, task_id, remove_all):
+    """显式回收批量恢复的 staging 残留（恢复流程本身不会静默删除）。"""
+    workdir = ctx.obj["workdir"]
+    _, _, store, _ = runtime(workdir)
+    emit(cleanup_staging(workdir, store, task_id=task_id, remove_all=remove_all))
 
 
 @click.command("audit-export")

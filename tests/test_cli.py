@@ -150,3 +150,59 @@ def test_test_command_wrapper(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert "pytest" in calls["command"]
     assert Path(calls["cwd"]).name == "solo11-0012" or Path(calls["cwd"]).exists()
+
+
+def test_restore_batch_and_cleanup_cli(tmp_path, long_source, monkeypatch):
+    import time_archiver.restore as restore_module
+    monkeypatch.setattr(restore_module, "MAX_MEMBERS_PER_UNIT", 1)
+    runner = CliRunner()
+    workdir = tmp_path / "cli"
+    archived = run(runner, workdir, "archive", "--source", str(long_source.path),
+                   "--source-id", "batch-long",
+                   "--metric-columns", "temperature,humidity,pressure")
+    assert archived.exit_code == 0, archived.output
+    out_a = tmp_path / "batch-a"
+    first = run(runner, workdir, "restore-batch", "--jobs", "1",
+                "--label", "sensor_id=sensor-long", "--out", str(out_a))
+    assert first.exit_code == 0, first.output
+    payload = json.loads(first.output)
+    assert payload["status"] == "completed"
+    assert payload["total_units"] >= 1
+    assert (out_a / "restore_manifest.json").exists()
+    out_b = tmp_path / "batch-b"
+    second = run(runner, workdir, "restore-batch", "--jobs", "4",
+                 "--label", "sensor_id=sensor-long", "--out", str(out_b))
+    assert second.exit_code == 0
+    names = sorted(p.name for p in out_a.iterdir())
+    assert names == sorted(p.name for p in out_b.iterdir())
+    for name in names:
+        assert (out_a / name).read_bytes() == (out_b / name).read_bytes()
+    # 重跑同目录：全部单元跳过
+    again = run(runner, workdir, "restore-batch", "--jobs", "4",
+                "--label", "sensor_id=sensor-long", "--out", str(out_a))
+    assert json.loads(again.output)["skipped_units"] == payload["total_units"]
+    cleanup = run(runner, workdir, "restore-cleanup")
+    assert cleanup.exit_code == 0
+    bad_label = run(runner, workdir, "restore-batch", "--label", "no-equals")
+    assert bad_label.exit_code == 1
+    no_match = run(runner, workdir, "restore-batch",
+                   "--start", "2099-01-01", "--end", "2099-02-01")
+    assert no_match.exit_code == 1
+    assert "没有命中" in no_match.output
+
+
+def test_legacy_restore_defaults_unchanged(tmp_path, long_source, monkeypatch):
+    runner = CliRunner()
+    workdir = tmp_path / "legacy-cli"
+    run(runner, workdir, "archive", "--source", str(long_source.path),
+        "--source-id", "legacy-long",
+        "--metric-columns", "temperature,humidity,pressure")
+    entry = json.loads(run(runner, workdir, "search",
+                           "--label-value", "sensor-long").output)["entries"][0]
+    # 默认 --out restored 是相对当前工作目录的；在临时目录内验证该行为不变
+    monkeypatch.chdir(tmp_path)
+    restored = run(runner, workdir, "restore", "--shard-id", entry["shard_id"])
+    assert restored.exit_code == 0
+    target = Path(json.loads(restored.output)["restored"])
+    assert target == Path("restored") / target.name
+    assert (tmp_path / "restored" / target.name).exists()

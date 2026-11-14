@@ -13,7 +13,9 @@ from typing import Any, Dict, Iterable, List, Tuple
 import pandas as pd
 
 from .data_reader import TIMESTAMP
-from .schema import IndexEntry, PolicyTier, bytes_sha256, safe_name
+from .schema import (
+    ArchiveError, IndexEntry, PolicyTier, bytes_sha256, file_sha256, safe_name,
+)
 
 DATA_MEMBER = "data"
 INDEX_MEMBER = "index.json"
@@ -108,6 +110,11 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
     }
     suffix = extension_for(tier.format, tier.compression)
     member_name = f"{DATA_MEMBER}.{suffix}"
+    member_digest = bytes_sha256(payload)
+    manifest["members"] = [{
+        "name": member_name, "sha256": member_digest,
+        "row_count": int(len(frame)),
+    }]
     members = [(member_name, payload),
                (INDEX_MEMBER, (json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                           indent=2) + "\n").encode("utf-8"))]
@@ -120,7 +127,7 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
         shard_id="", package_path=relative, member_name=member_name,
         offset=offset, size=size, row_count=int(len(frame)),
         min_ts=min_ts, max_ts=max_ts, tags=tags, tier=tier.name,
-        source=source_id,
+        source=source_id, member_sha256=member_digest,
     )
     return bytes_sha256(package_bytes), len(package_bytes), [entry]
 
@@ -207,6 +214,56 @@ def restore_by_entry(workdir: Path, entry: Dict[str, Any], output_dir: Path) -> 
                           shard_id=entry.get("shard_id", ""))
 
 
+def read_member_at_offset(package_path: Path, offset: int, size: int) -> bytes:
+    """按包内 tar 成员偏移定点读取，只解压该成员段，不扫描/解压整个 tar.gz。"""
+    package_path = Path(package_path)
+    try:
+        with package_path.open("rb") as handle:
+            with gzip.GzipFile(fileobj=handle, mode="rb") as stream:
+                stream.seek(int(offset))
+                data = stream.read(int(size))
+    except (OSError, EOFError, gzip.BadGzipFile) as exc:
+        raise ArchiveError(f"归档包成员偏移读取失败: {package_path} ({exc})") from exc
+    if len(data) != int(size):
+        raise ArchiveError(
+            f"成员偏移读取长度不足: 期望 {size} 字节，实际 {len(data)} 字节 "
+            f"({package_path})")
+    return data
+
+
+def member_hash_from_manifest(package_path: Path, member_name: str) -> str:
+    """从包内 index.json 取数据成员的 SHA256；旧包没有 members 清单时返回空串。"""
+    manifest = read_package_index(package_path)
+    for item in manifest.get("members", []) or []:
+        if isinstance(item, dict) and item.get("name") == member_name:
+            return str(item.get("sha256") or "")
+    return ""
+
+
+def verify_member_bytes(package_path: Path, entry: Dict[str, Any],
+                        data: bytes) -> None:
+    """校验成员负载哈希。
+
+    优先级：索引登记的成员级 sha256 最高；仅当成员哈希与整包哈希都未登记
+    时，才查包内 index.json 补齐成员哈希（避免绕过调用方显式给定的整包
+    校验）；两者都没有成员哈希时，最后用分片表的整包 sha256 兜底。
+    """
+    actual = bytes_sha256(data)
+    expected = str(entry.get("member_sha256") or "")
+    if not expected and not entry.get("package_sha256"):
+        # 只有两边都没有登记时才查包内清单，避免绕过调用方给定的整包校验。
+        expected = member_hash_from_manifest(package_path, entry["member_name"])
+    if expected:
+        if actual != expected:
+            raise ArchiveError(
+                f"成员 sha256 校验失败: {entry.get('package_path')}!"
+                f"{entry.get('member_name')} 期望 {expected[:12]} 实际 {actual[:12]}")
+        return
+    package_digest = str(entry.get("package_sha256") or "")
+    if package_digest and file_sha256(package_path) != package_digest:
+        raise ArchiveError(f"归档包整体 sha256 校验失败: {package_path}")
+
+
 def verify_package(package_path: Path) -> bool:
     try:
         with tarfile.open(Path(package_path), mode="r:gz") as archive:
@@ -234,12 +291,16 @@ def entries_for_existing_package(package_path: Path, relative_path: str,
     with tarfile.open(package_path, mode="r:gz") as archive:
         member = archive.getmember(data_member)
         offset, size = int(member.offset_data), int(member.size)
+    member_digest = ""
+    for item in manifest.get("members", []) or []:
+        if isinstance(item, dict) and item.get("name") == data_member:
+            member_digest = str(item.get("sha256") or "")
     return [IndexEntry(
         shard_id=shard_id, package_path=relative_path, member_name=data_member,
         offset=offset, size=size, row_count=int(manifest.get("row_count", 0)),
         min_ts=manifest.get("min_ts", ""), max_ts=manifest.get("max_ts", ""),
         tags=manifest.get("tags", {}), tier=manifest.get("tier", ""),
-        source=manifest.get("source", ""),
+        source=manifest.get("source", ""), member_sha256=member_digest,
     )]
 
 

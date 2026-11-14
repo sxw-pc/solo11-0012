@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from .schema import IndexEntry, ShardRecord
 
-from .storage_schema import SCHEMA
+from .storage_schema import MIGRATIONS, SCHEMA
 
 
 def utc_now() -> str:
@@ -40,6 +40,15 @@ class MetadataStore:
     def init_schema(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            self._run_migrations(connection)
+
+    def _run_migrations(self, connection: sqlite3.Connection) -> None:
+        """对旧版数据库做只增不删的列迁移，保持历史记录不变。"""
+        for table, column, statement in MIGRATIONS:
+            existing = {row["name"] for row in
+                        connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in existing:
+                connection.execute(statement)
 
     def start_task(self, task_id: str, kind: str, source: str,
                    policy_hash: str, range_start: str = "",
@@ -175,11 +184,12 @@ class MetadataStore:
             for entry in entries:
                 connection.execute(
                     "INSERT INTO archive_index(shard_id,package_path,member_name,offset,size,"
-                    "row_count,min_ts,max_ts,tags_json,tier,source) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "row_count,min_ts,max_ts,tags_json,tier,source,member_sha256) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (entry.shard_id, entry.package_path, entry.member_name, entry.offset,
                      entry.size, entry.row_count, entry.min_ts, entry.max_ts,
                      json.dumps(entry.tags, ensure_ascii=False, sort_keys=True),
-                     entry.tier, entry.source))
+                     entry.tier, entry.source, entry.member_sha256))
                 for key, values in sorted(entry.tags.items()):
                     for value in sorted(set(map(str, values))):
                         connection.execute(
@@ -189,8 +199,20 @@ class MetadataStore:
     def search(self, start: Optional[str] = None, end: Optional[str] = None,
                tag_key: str = "", tag_value: str = "",
                limit: int = 200) -> list[Dict[str, Any]]:
-        query = ("SELECT ai.*, s.sha256 FROM archive_index ai JOIN shards s "
-                 "ON s.shard_id=ai.shard_id AND s.active=1 AND s.path=ai.package_path WHERE 1=1")
+        labels = [(tag_key, tag_value)] if tag_key and tag_value else []
+        return self.search_members(start, end, labels, limit)
+
+    def search_members(self, start: Optional[str] = None, end: Optional[str] = None,
+                       labels: Optional[Iterable[tuple[str, str]]] = None,
+                       limit: Optional[int] = 10000) -> list[Dict[str, Any]]:
+        """按时间范围与多标签组合（AND 语义）检索命中成员，附整包与成员哈希。
+
+        ``limit=None`` 表示不限制条数，供完整性敏感的批量恢复使用，避免
+        命中量超过上限时被静默截断。
+        """
+        query = ("SELECT ai.*, s.sha256 AS package_sha256 FROM archive_index ai "
+                 "JOIN shards s ON s.shard_id=ai.shard_id AND s.active=1 "
+                 "AND s.path=ai.package_path WHERE 1=1")
         values: list[Any] = []
         if start:
             query += " AND ai.max_ts >= ?"
@@ -198,12 +220,16 @@ class MetadataStore:
         if end:
             query += " AND ai.min_ts <= ?"
             values.append(end)
-        if tag_key and tag_value:
+        for key, value in (labels or []):
+            if not key:
+                continue
             query += (" AND EXISTS (SELECT 1 FROM label_index li WHERE "
                       "li.shard_id=ai.shard_id AND li.tag_key=? AND li.tag_value=?)")
-            values.extend([tag_key, str(tag_value)])
-        query += " ORDER BY ai.min_ts, ai.package_path LIMIT ?"
-        values.append(int(limit))
+            values.extend([key, str(value)])
+        query += " ORDER BY ai.min_ts, ai.member_name, ai.package_path, ai.id"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(int(limit))
         with self._connect() as connection:
             rows = connection.execute(query, values).fetchall()
         output = []
@@ -269,6 +295,81 @@ class MetadataStore:
                 "archives": connection.execute(
                     "SELECT COUNT(*) FROM archive_index").fetchone()[0],
             }
+
+    # ---- 批量恢复的断点表（resume）----
+
+    def get_restore_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM restore_tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["spec"] = _loads(item.pop("spec_json"), {})
+        return item
+
+    def save_restore_task(self, task_id: str, spec: Dict[str, Any], output_dir: str,
+                          total_units: int, total_members: int,
+                          status: str = "running", error: str = "") -> None:
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO restore_tasks(task_id,spec_json,output_dir,status,total_units,"
+                "total_members,created_at,updated_at,error) VALUES(?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET status=excluded.status,"
+                "total_units=excluded.total_units,total_members=excluded.total_members,"
+                "updated_at=excluded.updated_at,error=excluded.error",
+                (task_id, json.dumps(spec, ensure_ascii=False, sort_keys=True),
+                 output_dir, status, int(total_units), int(total_members), now, now, error))
+
+    def update_restore_task(self, task_id: str, status: str, error: str = "") -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE restore_tasks SET status=?, updated_at=?, error=? WHERE task_id=?",
+                (status, utc_now(), error, task_id))
+
+    def list_restore_units(self, task_id: str) -> list[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM restore_units WHERE task_id=? ORDER BY unit_seq",
+                (task_id,)).fetchall()
+        output = []
+        for row in rows:
+            item = dict(row)
+            item["member_sha256"] = _loads(item.pop("member_sha256_json"), {})
+            item["output_files"] = _loads(item.pop("output_files_json"), [])
+            output.append(item)
+        return output
+
+    def prune_restore_units(self, task_id: str, keep: int) -> None:
+        """归档内容变化导致单元数减少时，清理过期的断点行。
+
+        只删除数据库行；对应单元的 staging 目录保留在磁盘上（遵循不静默
+        删除原则），由显式 ``restore-cleanup --task-id`` 统一回收。
+        """
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM restore_units WHERE task_id=? AND unit_seq>=?",
+                (task_id, int(keep)))
+
+    def save_restore_unit(self, task_id: str, unit_seq: int, status: str,
+                          package_path: str, member_count: int,
+                          member_sha256: Dict[str, str], output_files: list[str],
+                          staging_dir: str, error: str = "") -> None:
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO restore_units(task_id,unit_seq,status,package_path,member_count,"
+                "member_sha256_json,output_files_json,staging_dir,error,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(task_id,unit_seq) DO UPDATE SET status=excluded.status,"
+                "member_sha256_json=excluded.member_sha256_json,"
+                "output_files_json=excluded.output_files_json,error=excluded.error,"
+                "updated_at=excluded.updated_at",
+                (task_id, int(unit_seq), status, package_path, int(member_count),
+                 json.dumps(member_sha256, ensure_ascii=False, sort_keys=True),
+                 json.dumps(output_files, ensure_ascii=False, sort_keys=True),
+                 staging_dir, error, now))
 
 
 def _loads(value: Optional[str], default: Any) -> Any:

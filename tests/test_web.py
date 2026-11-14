@@ -118,3 +118,39 @@ def test_task_unknown_mode_still_uses_custom(client):
     response = client.post("/tasks/run", data={"mode": "unknown"})
     assert response.status_code == 200
     assert "路径不能为空" in response.get_data(as_text=True)
+
+
+def test_restore_batch_api_resume_and_audit_actor(client, archived, app):
+    from time_archiver import restore as restore_module
+    restore_module.MAX_MEMBERS_PER_UNIT = 1
+    workdir = Path(app.config["WORKDIR"])
+    response = client.post("/archive/restore-batch", data={
+        "start": "2024-01-01", "end": "2025-12-31",
+        "label_key": "sensor_id", "label_value": "sensor-long", "jobs": "4",
+    })
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "completed"
+    assert payload["total_units"] >= 1
+    manifest = workdir / "restored" / "restore_manifest.json"
+    assert manifest.exists()
+    # 重跑只做哈希复核，全部跳过（保持小单元切分；筛选条件必须一致才是同一任务）
+    restore_module.MAX_MEMBERS_PER_UNIT = 1
+    rerun = client.post("/archive/restore-batch", data={
+        "start": "2024-01-01", "end": "2025-12-31",
+        "label_key": "sensor_id", "label_value": "sensor-long", "jobs": "1"})
+    rerun_payload = rerun.get_json()
+    assert rerun_payload["skipped_units"] == payload["total_units"]
+    audit = _archiver_audit(app)
+    batches = audit.read(operation="restore_batch")
+    assert batches and all(item["actor"] == "WEB" for item in batches)
+    assert audit.verify()["valid"]
+    bad = client.post("/archive/restore-batch", data={"label": "no-equals"})
+    assert bad.status_code == 400
+    no_match = client.post("/archive/restore-batch",
+                           data={"start": "2099-01-01", "end": "2099-02-01"})
+    assert no_match.status_code == 400
+
+
+def _archiver_audit(app):
+    return app.extensions["time_archiver"]["archiver"].audit
