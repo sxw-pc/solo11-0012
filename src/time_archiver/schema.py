@@ -96,12 +96,31 @@ class PolicyTier:
 
 
 @dataclass(frozen=True)
+class PrecheckConfig:
+    """标签组合基数与稀疏度预检的可选配置。"""
+
+    enabled: bool = False
+    max_combinations: int = 5000
+    min_avg_bucket_coverage: float = 2.0
+    auto_apply: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "max_combinations": self.max_combinations,
+            "min_avg_bucket_coverage": self.min_avg_bucket_coverage,
+            "auto_apply": self.auto_apply,
+        }
+
+
+@dataclass(frozen=True)
 class Policy:
     name: str
     tiers: Tuple[PolicyTier, ...]
     version: int = 1
     reference: str = "data_max"
     quality: Dict[str, Any] = field(default_factory=dict)
+    precheck: PrecheckConfig = field(default_factory=PrecheckConfig)
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -111,6 +130,9 @@ class Policy:
             "reference": self.reference, "quality": self.quality,
             "tiers": [t.to_dict() for t in self.tiers],
         }
+        # 仅在配置显式声明 precheck 段时纳入哈希，保持既有策略哈希稳定。
+        if "precheck" in self.raw:
+            payload["precheck"] = self.precheck.to_dict()
         return canonical_hash(payload)
 
     @property
@@ -118,11 +140,14 @@ class Policy:
         return self.tiers[-1]
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "version": self.version, "name": self.name,
             "reference": self.reference, "quality": self.quality,
             "tiers": [t.to_dict() for t in self.tiers],
         }
+        if "precheck" in self.raw:
+            payload["precheck"] = self.precheck.to_dict()
+        return payload
 
 
 @dataclass
@@ -171,6 +196,7 @@ class ShardRecord:
     sha256: str
     created_at: str = ""
     active: int = 1
+    aggregation_mode: str = "global"
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -189,6 +215,7 @@ class IndexEntry:
     tags: Dict[str, list]
     tier: str
     source: str
+    coverage_member: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)

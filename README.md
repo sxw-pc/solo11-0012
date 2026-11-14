@@ -100,6 +100,23 @@ python -m pytest
 
 审计日志采用 JSONL 追加写，每条记录包含序号、时间、操作、执行来源、任务标识、范围、输入哈希、输出哈希、结果、错误与详情。每条记录的 `prev_hash` 指向上一条记录的 `entry_hash`，首条记录的前序哈希为空串。修改任何历史字段都会使后续哈希链校验失败。审计导出支持 JSON 与 Markdown。
 
+### 4.9 标签组合基数与稀疏度预检
+
+不同数据源的标签基数差异很大：同一层同一月份的分片里，稀疏组合可能被密集组合的全局采样节奏稀释，`missing_count` 等质量标记失去参考意义。预检在正式归档之前，对每个层级按自然月推算三个指标：
+
+- `combinations`：该层该月出现的标签组合数。
+- `buckets`：该层该月按层级粒度对齐后的时间桶数。
+- `avg_buckets_per_combo`：每个组合平均覆盖的时间桶数（稀疏度）。
+
+当任一月份的组合数超过 `precheck.max_combinations`，或每组合平均覆盖桶数低于 `precheck.min_avg_bucket_coverage`（过稀疏）时，该层的聚合方式从全局分组切换为**分片内按组合局部聚合**：每个标签组合使用自身节奏推断理论槽位，再独立聚合。局部聚合不改变 `raw_count`、`valid_count`、`missing_count`、`anomaly_count` 四个质量列的口径与类型，仅让 `missing_count` 的理论槽位按组合自身节奏计算。
+
+局部聚合的分片会在分片元数据中记录一张**组合覆盖率表**（每个组合的覆盖桶数与有效点数），可直接对原始数据回算核对。覆盖率表持久化在 SQLite 的 `combo_coverage` 表；归档层分片同时在包内附加 `coverage.json` 成员，并在 `index.json` 清单与 `archive_index` 条目中声明，旧版本没有覆盖率表的分片与归档包仍可正常检索、恢复。
+
+预检入口有两处，均不写入任务表、不占用归档任务序号：
+
+- `precheck` 子命令：对任意数据源独立执行预检，报告确定性落盘到 `state/precheck/`，同一输入重复执行逐字节一致，结论写入审计链（`precheck` 操作）。
+- 策略中的 `precheck` 配置段：`enabled: true` 时归档流程自动执行预检，`auto_apply: true` 时把超限层切换为局部聚合；预检未超限或配置缺席时，归档输出与未启用预检完全一致。
+
 ## 五、配置详解
 
 默认策略位于 `config/default_policy.yaml`，示例策略位于 `config/example_policies/`。以下是一个最小可运行示例：
@@ -151,6 +168,13 @@ tiers:
 - `aggregations`：必须包含 `default`，指标名可覆盖默认算子。
 - `gap_strategy`：`skip` 不生成缺失桶，`null` 生成空值行，`ffill` 用同标签前一个有效值填充。
 - `path`：必须是工作目录内的相对路径，禁止绝对路径和 `..` 越界。
+- `precheck`：可选预检配置段，缺席时预检完全关闭且策略哈希与历史版本一致。子字段：
+  - `enabled`：布尔值，默认 `false`；为 `true` 时归档流程自动执行预检并写审计。
+  - `max_combinations`：正整数，默认 `5000`；单层单自然月标签组合数上限。
+  - `min_avg_bucket_coverage`：非负数字，默认 `2.0`；每组合平均覆盖桶数低于该值视为过稀疏。
+  - `auto_apply`：布尔值，默认 `true`；为 `true` 时超限层自动切换为局部聚合，为 `false` 时只出报告不改行为。
+
+预检配置段存在时会参与策略哈希，因此调整阈值会形成新的任务标识；`precheck` 段不改变 `tiers` 的任何字段。层级窗口边缘的不完整月份可能只有很少时间桶，容易触发稀疏度判定，可按数据特点调低 `min_avg_bucket_coverage` 或将其设为 `0` 关闭稀疏度判定。
 
 执行 `time-archiver --workdir demo_work validate-config` 可以校验工作目录中的策略；使用 `--config` 指定其他 YAML。校验失败会输出字段级错误并写入失败审计记录。
 
@@ -164,6 +188,7 @@ tiers:
 | `load-demo` | 校验并列出三组内置演示数据 |
 | `validate-config` | 校验策略字段、粒度、保留周期和路径 |
 | `archive` | 对单个 Parquet、CSV 或 SQLite 源执行分层归档 |
+| `precheck` | 归档前预检标签组合基数与稀疏度，输出确定性报告 |
 | `demo` | 一键跑通加载、归档、索引、检索、恢复与审计验证 |
 | `schedule` | 在本进程内按固定间隔重复归档演示数据 |
 | `tasks` | 查询任务状态、阶段、质量和输出信息 |
@@ -185,6 +210,14 @@ time-archiver --workdir demo_work archive --source ./data/metrics.parquet \
 ```
 
 SQLite 输入默认只读打开，需通过 `--table` 指定表名。CSV 输入使用 UTF-8 文本。时间列支持常见日期时间字符串、Unix 秒和毫秒时间戳；解析失败的行会被计入类型错误，严重质量问题时任务失败且不会写入正式索引。
+
+预检示例（与 `archive` 共享输入参数，不写任务表，报告落盘 `state/precheck/`）：
+
+```bash
+time-archiver --workdir demo_work precheck --source ./data/metrics.parquet \
+  --format parquet --label-columns sensor_id,metric_group \
+  --metric-columns temperature,humidity,pressure --source-id edge-a
+```
 
 检索示例：
 

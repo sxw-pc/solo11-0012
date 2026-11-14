@@ -11,17 +11,19 @@ import yaml
 
 from .schema import (
     AGGREGATORS, GAP_STRATEGIES, SUPPORTED_FORMATS, ConfigError, Policy,
-    PolicyTier, parse_granularity,
+    PolicyTier, PrecheckConfig, parse_granularity,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_POLICY_PATH = PROJECT_ROOT / "config" / "default_policy.yaml"
 MAX_TIERS = 5
-TOP_KEYS = {"version", "name", "reference", "quality", "tiers"}
+TOP_KEYS = {"version", "name", "reference", "quality", "tiers", "precheck"}
 TIER_KEYS = {
     "name", "granularity", "retention_days", "path", "format",
     "compression", "aggregations", "gap_strategy",
 }
+PRECHECK_KEYS = {"enabled", "max_combinations", "min_avg_bucket_coverage",
+                 "auto_apply"}
 COMPRESSIONS = {
     "parquet": {"zstd", "snappy", "gzip", "none"},
     "csv": {"none", "gzip"},
@@ -166,12 +168,46 @@ def load_policy(path: Path, workdir: Optional[Path] = None) -> Policy:
         for index in range(1, len(valid_days)):
             if valid_days[index] <= valid_days[index - 1]:
                 errors.append(f"tiers[{index}].retention_days: 保留周期必须严格递增")
+    precheck = _parse_precheck(data.get("precheck"), errors)
     if workdir is not None:
         errors.extend(_validate_paths(tiers, Path(workdir)))
     if errors:
         raise ConfigError(errors)
     return Policy(name=name, tiers=tuple(tiers), version=version,
-                  reference=reference, quality=quality, raw=data)
+                  reference=reference, quality=quality, precheck=precheck, raw=data)
+
+
+def _parse_precheck(raw: Any, errors: list[str]) -> PrecheckConfig:
+    """解析可选的预检配置段；缺省时返回关闭状态的默认配置。"""
+    if raw is None:
+        return PrecheckConfig()
+    if not isinstance(raw, dict):
+        errors.append("precheck: 必须是映射")
+        return PrecheckConfig()
+    unknown = sorted(set(raw) - PRECHECK_KEYS)
+    if unknown:
+        errors.append(f"precheck: 未知字段 {', '.join(unknown)}")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        errors.append("precheck.enabled: 必须是布尔值")
+        enabled = False
+    auto_apply = raw.get("auto_apply", True)
+    if not isinstance(auto_apply, bool):
+        errors.append("precheck.auto_apply: 必须是布尔值")
+        auto_apply = True
+    max_combinations = raw.get("max_combinations", 5000)
+    if (isinstance(max_combinations, bool) or not isinstance(max_combinations, int)
+            or max_combinations <= 0):
+        errors.append("precheck.max_combinations: 必须是正整数")
+        max_combinations = 5000
+    min_coverage = raw.get("min_avg_bucket_coverage", 2.0)
+    if (isinstance(min_coverage, bool) or not isinstance(min_coverage, (int, float))
+            or min_coverage < 0):
+        errors.append("precheck.min_avg_bucket_coverage: 必须是非负数字")
+        min_coverage = 2.0
+    return PrecheckConfig(enabled=enabled, max_combinations=max_combinations,
+                          min_avg_bucket_coverage=float(min_coverage),
+                          auto_apply=auto_apply)
 
 
 def _validate_paths(tiers: list[PolicyTier], workdir: Path) -> list[str]:

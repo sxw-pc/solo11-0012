@@ -2,6 +2,23 @@
 
 本文档记录时档匠的版本演进。日期使用本地项目日期，版本号遵循语义化版本的基本约定。
 
+## 1.1.0 - 2026-11-14
+
+### 新增
+
+- 标签组合基数与稀疏度预检：按层按自然月推算组合数、时间桶数与每组合平均覆盖桶数，超阈值层自动从全局分组切换为分片内按组合局部聚合。
+- 局部聚合模式：每个标签组合按自身节奏推断理论槽位后独立聚合；`raw_count`、`valid_count`、`missing_count`、`anomaly_count` 四个质量列口径与类型不变。
+- 分片级组合覆盖率表：记录每个组合的覆盖桶数与有效点数，可对原始数据回算核对；SQLite 新增 `combo_coverage` 表，归档包新增 `coverage.json` 成员与清单声明，`archive_index` 新增 `coverage_member` 列。
+- 策略可选 `precheck` 配置段（`enabled`、`max_combinations`、`min_avg_bucket_coverage`、`auto_apply`），配置段存在时参与策略哈希。
+- 新 CLI 子命令 `precheck`：独立执行预检，确定性报告落盘 `state/precheck/`，结论写审计链但不写任务表。
+- 旧版工作目录自动列迁移：`shards.aggregation_mode`、`shard_history.prev_aggregation_mode`、`archive_index.coverage_member`。
+
+### 兼容性说明
+
+- 未声明 `precheck` 段的策略哈希与 1.0.0 完全一致，归档输出逐字节兼容。
+- 未启用预检或预检未超限时，归档包结构与分片文件和 1.0.0 逐字节一致。
+- 没有覆盖率表的旧分片、旧归档包可正常检索、恢复与回滚重建。
+
 ## 1.0.0 - 2026-11-11
 
 ### 新增

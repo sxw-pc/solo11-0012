@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -16,10 +15,13 @@ from .data_reader import TIMESTAMP, read_source
 from .downsample import downsample_frame
 from .index_builder import (
     atomic_write, build_archive_package, entries_for_existing_package,
-    extension_for, restore_by_entry, serialize_frame, verify_package,
-    verify_serialized,
+    extension_for, read_package_coverage, restore_by_entry, serialize_frame,
+    verify_package, verify_serialized,
 )
 from .metadata_store import MetadataStore, utc_now
+from .precheck import (
+    combo_coverage, exceeded_months, run_precheck, select_tier_rows,
+)
 from .schema import (
     ArchiveError, DataSourceError, IndexEntry, Policy, PolicyTier, ShardRecord,
     SourceSpec, bytes_sha256, canonical_hash, file_sha256, safe_name,
@@ -67,19 +69,24 @@ class Archiver:
             if not report.ok:
                 raise DataSourceError("；".join(report.issues) or "数据质量校验未通过")
             start, end = _bounds(frame)
+            decisions = self._precheck(spec, frame, report, start, end, actor)
             self.store.start_task(task_id, "archive", spec.source_id,
                                   self.policy.hash, start, end)
             self.store.update_task(task_id, status="running", stage="source_loaded",
                                    range_start=start, range_end=end)
-            result = self._archive_frame(task_id, spec, frame, report, start, end)
+            result = self._archive_frame(task_id, spec, frame, report, start, end,
+                                         decisions=decisions)
             self.store.finish_task(task_id, "completed", result)
+            details = {"source": spec.source_id, "policy": self.policy.name,
+                       "tiers": {k: v["rows"] for k, v in result["tiers"].items()},
+                       "quality": report.to_dict()}
+            if decisions:
+                details["aggregation"] = decisions
             self.audit.log(
                 "archive", actor, task_id=task_id, range_start=start, range_end=end,
                 input_hashes=[report.source_hash],
                 output_hashes=result["output_hashes"], result="success",
-                details={"source": spec.source_id, "policy": self.policy.name,
-                         "tiers": {k: v["rows"] for k, v in result["tiers"].items()},
-                         "quality": report.to_dict()})
+                details=details)
             return result
         except Exception as exc:
             self.store.update_task(task_id, status="failed", stage="failed",
@@ -89,28 +96,51 @@ class Archiver:
                            details={"source": spec.source_id})
             raise
 
+    def _precheck(self, spec: SourceSpec, frame: pd.DataFrame, report: Any,
+                  start: str, end: str, actor: str) -> Optional[Dict[str, str]]:
+        """策略启用预检时执行基数/稀疏度检查并写审计；返回各层聚合决策。
+
+        预检不写入任务表，不占用归档任务序号；未启用时返回 None，
+        归档流程与未安装预检能力时完全一致。
+        """
+        config = self.policy.precheck
+        if not config.enabled:
+            return None
+        precheck_report, digest, path = run_precheck(
+            self.workdir, spec, self.policy, frame, report.source_hash)
+        relative = path.relative_to(self.workdir).as_posix()
+        self.audit.log(
+            "precheck", actor, task_id=precheck_report["precheck_id"],
+            range_start=start, range_end=end,
+            input_hashes=[report.source_hash], output_hashes=[digest],
+            result="success",
+            details={"source": spec.source_id, "policy": self.policy.name,
+                     "decisions": precheck_report["decisions"],
+                     "exceeded": exceeded_months(precheck_report),
+                     "report": relative,
+                     "auto_apply": config.auto_apply})
+        if not config.auto_apply:
+            return None
+        return dict(precheck_report["decisions"])
+
     def _archive_frame(self, task_id: str, spec: SourceSpec, frame: pd.DataFrame,
-                       report: Any, start: str, end: str) -> Dict[str, Any]:
-        anchor = pd.to_datetime(frame[TIMESTAMP], errors="coerce").max()
-        age = anchor - pd.to_datetime(frame[TIMESTAMP])
+                       report: Any, start: str, end: str,
+                       decisions: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         tiers_result: Dict[str, Any] = {}
         output_hashes: list[str] = []
-        previous_days = 0
         for position, tier in enumerate(self.policy.tiers):
             self.store.update_task(task_id, stage=f"tier:{tier.name}")
-            if len(self.policy.tiers) == 1:
-                selected = frame
-            elif position == 0:
-                selected = frame[age <= timedelta(days=tier.retention_days)]
-            elif position == len(self.policy.tiers) - 1:
-                selected = frame[age > timedelta(days=previous_days)]
-            else:
-                selected = frame[(age > timedelta(days=previous_days)) &
-                                 (age <= timedelta(days=tier.retention_days))]
-            previous_days = tier.retention_days
+            selected = select_tier_rows(frame, self.policy.tiers, position)
+            mode = (decisions or {}).get(tier.name, "global")
             if selected.empty:
                 tiers_result[tier.name] = {"rows": 0, "raw_rows": 0, "shards": 0,
                                            "missing": 0, "anomalies": 0}
+                if decisions is not None:
+                    tiers_result[tier.name]["mode"] = mode
+                continue
+            if mode == "local":
+                tiers_result[tier.name] = self._archive_tier_local(
+                    task_id, spec, tier, selected, report, output_hashes)
                 continue
             aggregated = downsample_frame(
                 selected, tier, spec.label_columns, spec.metric_columns,
@@ -118,6 +148,8 @@ class Archiver:
             if aggregated.empty:
                 tiers_result[tier.name] = {"rows": 0, "raw_rows": len(selected),
                                            "shards": 0, "missing": 0, "anomalies": 0}
+                if decisions is not None:
+                    tiers_result[tier.name]["mode"] = mode
                 continue
             aggregated["__partition"] = pd.to_datetime(aggregated[TIMESTAMP]).dt.strftime("%Y-%m")
             rows = 0
@@ -137,6 +169,8 @@ class Archiver:
                 "missing": int(aggregated["missing_count"].sum()),
                 "anomalies": int(aggregated["anomaly_count"].sum()),
             }
+            if decisions is not None:
+                tiers_result[tier.name]["mode"] = mode
         return {
             "task_id": task_id, "source": spec.source_id, "status": "completed",
             "range_start": start, "range_end": end,
@@ -146,8 +180,48 @@ class Archiver:
             "cached": False,
         }
 
+    def _archive_tier_local(self, task_id: str, spec: SourceSpec, tier: PolicyTier,
+                            selected: pd.DataFrame, report: Any,
+                            output_hashes: list[str]) -> Dict[str, Any]:
+        """局部聚合层：先按自然月切分，再在分片内按标签组合独立聚合。
+
+        每个分片附带组合覆盖率表（覆盖桶数与有效点数），四个质量列的
+        口径与全局模式一致，仅理论槽位按组合自身节奏计算。
+        """
+        windowed = selected.copy()
+        windowed["__partition"] = (pd.to_datetime(windowed[TIMESTAMP])
+                                   .dt.strftime("%Y-%m"))
+        rows = 0
+        shards = 0
+        missing = 0
+        anomalies = 0
+        for partition, raw_part in windowed.groupby("__partition", sort=True):
+            raw_part = raw_part.drop(columns="__partition")
+            aggregated = downsample_frame(
+                raw_part, tier, spec.label_columns, spec.metric_columns,
+                report.interval_seconds, mode="local")
+            if aggregated.empty:
+                continue
+            coverage = combo_coverage(raw_part, tier, spec.label_columns,
+                                      spec.metric_columns)
+            record, entries = self._persist(task_id, spec, tier, str(partition),
+                                            aggregated, coverage=coverage,
+                                            mode="local")
+            output_hashes.append(record.sha256)
+            rows += record.row_count
+            shards += 1
+            missing += int(aggregated["missing_count"].sum())
+            anomalies += int(aggregated["anomaly_count"].sum())
+            if entries:
+                entries = [replace(entry, shard_id=record.shard_id,
+                                   package_path=record.path) for entry in entries]
+                self.store.replace_index(entries)
+        return {"rows": rows, "raw_rows": int(len(selected)), "shards": shards,
+                "missing": missing, "anomalies": anomalies, "mode": "local"}
+
     def _persist(self, task_id: str, spec: SourceSpec, tier: PolicyTier,
-                 partition: str, part: pd.DataFrame):
+                 partition: str, part: pd.DataFrame,
+                 coverage: Optional[list] = None, mode: str = "global"):
         shard_id = canonical_hash([tier.name, spec.source_id, partition])[:24]
         staging = self.staging / f"{shard_id}-{uuid4().hex}.tmp"
         is_archive = tier is self.policy.archive_tier
@@ -156,7 +230,7 @@ class Archiver:
             if is_archive:
                 digest, _size, entries = build_archive_package(
                     part, staging, tier, spec.label_columns, spec.metric_columns,
-                    spec.source_id)
+                    spec.source_id, coverage=coverage, aggregation_mode=mode)
                 if not verify_package(staging):
                     raise ArchiveError(f"归档包完整性校验失败: {partition}")
                 extension = "tar.gz"
@@ -190,8 +264,9 @@ class Archiver:
             raw_count=int(part["raw_count"].sum()),
             missing_count=int(part["missing_count"].sum()),
             anomaly_count=int(part["anomaly_count"].sum()),
-            sha256=digest, created_at=utc_now())
+            sha256=digest, created_at=utc_now(), aggregation_mode=mode)
         self.store.save_shard(record)
+        self.store.replace_coverage(shard_id, coverage or [])
         if entries:
             self.store.replace_index([replace(entry, shard_id=shard_id,
                                               package_path=relative) for entry in entries])
@@ -236,6 +311,9 @@ class Archiver:
                 entries = entries_for_existing_package(package, shard["path"],
                                                        shard["shard_id"])
                 self.store.replace_index(entries)
+                # 旧版归档包没有 coverage.json 时保持空覆盖率表。
+                self.store.replace_coverage(
+                    shard["shard_id"], read_package_coverage(package) or [])
         self.audit.log("rollback", actor, task_id=task["task_id"],
                        range_start=task.get("range_start", ""),
                        range_end=task.get("range_end", ""),

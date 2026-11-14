@@ -1,4 +1,4 @@
-"""数据操作类子命令：归档、恢复和审计导出。"""
+"""数据操作类子命令：归档、预检、恢复和审计导出。"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,7 +8,9 @@ import click
 from .audit import AuditLog
 from .cli_helpers import emit, runtime
 from .config_loader import init_workspace
+from .data_reader import read_source
 from .index_builder import extract_member
+from .precheck import exceeded_months, run_precheck
 from .schema import ArchiveError, ConfigError, DataSourceError, SourceSpec, file_sha256
 
 
@@ -44,6 +46,46 @@ def archive_cmd(ctx, source_path, fmt, timestamp_column, label_columns,
         emit(archiver.run_source(spec))
     except (DataSourceError, ArchiveError, ConfigError) as exc:
         raise click.ClickException(str(exc))
+
+
+@click.command("precheck")
+@source_options
+@click.pass_context
+def precheck_cmd(ctx, source_path, fmt, timestamp_column, label_columns,
+                 metric_columns, table, source_id):
+    """归档前预检：推算每层每月的标签组合基数与稀疏度并给出聚合决策。
+
+    只读取数据源与策略，不写任务表；报告确定性落盘到
+    state/precheck/ 并写一条 precheck 审计记录。
+    """
+    workdir = ctx.obj["workdir"]
+    policy, _, _, audit = runtime(workdir)
+    spec = SourceSpec(source_path, fmt, timestamp_column,
+                      tuple(filter(None, label_columns.split(","))),
+                      tuple(filter(None, metric_columns.split(","))), table, source_id)
+    try:
+        frame, quality = read_source(spec, policy.quality)
+        if not quality.ok:
+            raise DataSourceError("；".join(quality.issues) or "数据质量校验未通过")
+        report, digest, path = run_precheck(workdir, spec, policy, frame,
+                                            quality.source_hash)
+    except (DataSourceError, ConfigError) as exc:
+        raise click.ClickException(str(exc))
+    audit.log("precheck", "CLI", task_id=report["precheck_id"],
+              range_start=report["generated_from"]["range_start"],
+              range_end=report["generated_from"]["range_end"],
+              input_hashes=[quality.source_hash], output_hashes=[digest],
+              result="success",
+              details={"source": spec.source_id, "policy": policy.name,
+                       "decisions": report["decisions"],
+                       "exceeded": exceeded_months(report),
+                       "report": path.relative_to(workdir).as_posix(),
+                       "auto_apply": policy.precheck.auto_apply,
+                       "enabled": policy.precheck.enabled})
+    emit({**report, "report_path": str(path), "report_hash": digest,
+          "enabled": policy.precheck.enabled,
+          "auto_apply": policy.precheck.auto_apply,
+          "quality": quality.to_dict()})
 
 
 @click.command("restore")

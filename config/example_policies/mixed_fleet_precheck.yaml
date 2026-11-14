@@ -1,0 +1,42 @@
+# 场景：多型号设备混合上报，标签组合基数差异大，稀疏组合容易被密集组合
+# 的全局采样节奏稀释，导致 missing_count 等质量标记失去参考意义。
+# 建议：先用 precheck 子命令观察各层各月的组合数与稀疏度，再决定阈值。
+version: 1
+name: mixed_fleet_precheck
+reference: data_max
+quality:
+  value_ranges:
+    temperature: {min: -50, max: 150}
+    humidity: {min: 0, max: 100}
+
+precheck:
+  enabled: true              # 归档流程自动执行预检并写审计
+  max_combinations: 2000     # 单层单月标签组合数上限，按设备型号规模调整
+  min_avg_bucket_coverage: 2.0  # 每组合平均覆盖桶数下限，低于视为过稀疏
+  auto_apply: true           # 超限层自动切换分片内按组合局部聚合
+
+tiers:
+  - name: hot
+    granularity: 1m
+    retention_days: 14
+    path: tiers/hot
+    format: parquet
+    compression: zstd
+    aggregations: {default: mean}
+    gap_strategy: skip
+  - name: cold
+    granularity: 1h
+    retention_days: 180
+    path: tiers/cold
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean}
+    gap_strategy: skip
+  - name: archive
+    granularity: 1d
+    retention_days: 730
+    path: archives
+    format: parquet
+    compression: gzip
+    aggregations: {default: mean}
+    gap_strategy: skip

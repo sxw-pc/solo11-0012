@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from .schema import IndexEntry, ShardRecord
+from .schema import IndexEntry, ShardRecord, canonical_json
 
-from .storage_schema import SCHEMA
+from .storage_schema import COLUMN_MIGRATIONS, SCHEMA
 
 
 def utc_now() -> str:
@@ -40,6 +40,13 @@ class MetadataStore:
     def init_schema(self) -> None:
         with self._connect() as connection:
             connection.executescript(SCHEMA)
+            for table, columns in COLUMN_MIGRATIONS.items():
+                existing = {row[1] for row in
+                            connection.execute(f"PRAGMA table_info({table})")}
+                for column, ddl in columns.items():
+                    if column not in existing:
+                        connection.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def start_task(self, task_id: str, kind: str, source: str,
                    policy_hash: str, range_start: str = "",
@@ -116,28 +123,34 @@ class MetadataStore:
             old = connection.execute(
                 "SELECT * FROM shards WHERE shard_id=?", (record.shard_id,)).fetchone()
             if (old and old["sha256"] == record.sha256 and old["path"] == record.path
-                    and old["active"]):
+                    and old["active"]
+                    and old["aggregation_mode"] == record.aggregation_mode):
                 return False
             if old:
                 connection.execute(
                     "INSERT INTO shard_history(shard_id,task_id,prev_task_id,prev_path,"
-                    "prev_format,prev_sha256,prev_row_count,changed_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "prev_format,prev_sha256,prev_row_count,changed_at,"
+                    "prev_aggregation_mode) VALUES(?,?,?,?,?,?,?,?,?)",
                     (record.shard_id, record.task_id, old["task_id"], old["path"],
-                     old["format"], old["sha256"], old["row_count"], utc_now()))
+                     old["format"], old["sha256"], old["row_count"], utc_now(),
+                     old["aggregation_mode"]))
             connection.execute(
                 "INSERT INTO shards(shard_id,task_id,tier,source,partition,path,format,"
-                "row_count,raw_count,missing_count,anomaly_count,sha256,created_at,active) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1) "
+                "row_count,raw_count,missing_count,anomaly_count,sha256,created_at,active,"
+                "aggregation_mode) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1,?) "
                 "ON CONFLICT(shard_id) DO UPDATE SET task_id=excluded.task_id,"
                 "tier=excluded.tier,source=excluded.source,partition=excluded.partition,"
                 "path=excluded.path,format=excluded.format,row_count=excluded.row_count,"
                 "raw_count=excluded.raw_count,missing_count=excluded.missing_count,"
                 "anomaly_count=excluded.anomaly_count,sha256=excluded.sha256,"
-                "created_at=excluded.created_at,active=1",
+                "created_at=excluded.created_at,active=1,"
+                "aggregation_mode=excluded.aggregation_mode",
                 (record.shard_id, record.task_id, record.tier, record.source,
                  record.partition, record.path, record.fmt, record.row_count,
                  record.raw_count, record.missing_count, record.anomaly_count,
-                 record.sha256, record.created_at or utc_now()))
+                 record.sha256, record.created_at or utc_now(),
+                 record.aggregation_mode))
             return True
 
     def shards_for_task(self, task_id: str) -> list[Dict[str, Any]]:
@@ -175,16 +188,44 @@ class MetadataStore:
             for entry in entries:
                 connection.execute(
                     "INSERT INTO archive_index(shard_id,package_path,member_name,offset,size,"
-                    "row_count,min_ts,max_ts,tags_json,tier,source) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    "row_count,min_ts,max_ts,tags_json,tier,source,coverage_member) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (entry.shard_id, entry.package_path, entry.member_name, entry.offset,
                      entry.size, entry.row_count, entry.min_ts, entry.max_ts,
                      json.dumps(entry.tags, ensure_ascii=False, sort_keys=True),
-                     entry.tier, entry.source))
+                     entry.tier, entry.source, entry.coverage_member))
                 for key, values in sorted(entry.tags.items()):
                     for value in sorted(set(map(str, values))):
                         connection.execute(
                             "INSERT OR IGNORE INTO label_index(shard_id,tag_key,tag_value) "
                             "VALUES(?,?,?)", (entry.shard_id, key, value))
+
+    def replace_coverage(self, shard_id: str,
+                         entries: Iterable[Dict[str, Any]]) -> None:
+        """按分片整体替换组合覆盖率表；空列表表示清除（全局模式分片）。"""
+        rows = []
+        for entry in entries or []:
+            labels = {str(key): str(value)
+                      for key, value in (entry.get("labels") or {}).items()}
+            rows.append((shard_id, canonical_json(labels),
+                         json.dumps(labels, ensure_ascii=False, sort_keys=True),
+                         int(entry.get("covered_buckets", 0)),
+                         int(entry.get("valid_points", 0))))
+        with self._connect() as connection:
+            connection.execute("DELETE FROM combo_coverage WHERE shard_id=?",
+                               (shard_id,))
+            connection.executemany(
+                "INSERT OR REPLACE INTO combo_coverage(shard_id,combo_key,labels_json,"
+                "covered_buckets,valid_points) VALUES(?,?,?,?,?)", rows)
+
+    def coverage_for_shard(self, shard_id: str) -> list[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT labels_json,covered_buckets,valid_points FROM combo_coverage "
+                "WHERE shard_id=? ORDER BY combo_key", (shard_id,)).fetchall()
+        return [{"labels": _loads(row["labels_json"], {}),
+                 "covered_buckets": int(row["covered_buckets"]),
+                 "valid_points": int(row["valid_points"])} for row in rows]
 
     def search(self, start: Optional[str] = None, end: Optional[str] = None,
                tag_key: str = "", tag_value: str = "",
@@ -244,13 +285,18 @@ class MetadataStore:
                     "ORDER BY id DESC LIMIT 1", (row["shard_id"], task_id)).fetchone()
                 changed.append({"shard_id": row["shard_id"], "current_path": row["path"],
                                 "tier": row["tier"]})
+                # 覆盖率表描述的是被撤销版本的内容，一律先清除；
+                # 归档层分片由调用方从包内 coverage.json 重建。
+                connection.execute("DELETE FROM combo_coverage WHERE shard_id=?",
+                                   (row["shard_id"],))
                 if history:
                     connection.execute(
                         "UPDATE shards SET task_id=?,path=?,format=?,row_count=?,sha256=?,"
-                        "active=1 WHERE shard_id=?",
+                        "active=1,aggregation_mode=? WHERE shard_id=?",
                         (history["prev_task_id"], history["prev_path"],
                          history["prev_format"], history["prev_row_count"],
-                         history["prev_sha256"], row["shard_id"]))
+                         history["prev_sha256"], history["prev_aggregation_mode"],
+                         row["shard_id"]))
                 else:
                     connection.execute("UPDATE shards SET active=0 WHERE shard_id=?",
                                        (row["shard_id"],))

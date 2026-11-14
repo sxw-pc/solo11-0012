@@ -15,6 +15,15 @@ quality:
     voltage: {min: 180, max: 260}
     current: {min: 0, max: 100}
 
+# 可选预检配置段（默认关闭；整段缺席时策略哈希与历史版本一致）。
+# 启用后归档前会按层按自然月推算标签组合基数与稀疏度，超限层切换为
+# 分片内按组合局部聚合，并在分片元数据记录组合覆盖率表。
+# precheck:
+#   enabled: false             # 归档流程是否自动执行预检
+#   max_combinations: 5000     # 单层单月标签组合数上限
+#   min_avg_bucket_coverage: 2.0  # 每组合平均覆盖桶数下限（低于视为过稀疏）
+#   auto_apply: true           # 超限层是否自动切换局部聚合；false 只出报告
+
 tiers:
   # 热层：最近 30 天，保持接入原始粒度，供高频排查。
   - name: hot

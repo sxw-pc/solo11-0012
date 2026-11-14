@@ -8,7 +8,7 @@ import os
 import tarfile
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -17,6 +17,7 @@ from .schema import IndexEntry, PolicyTier, bytes_sha256, safe_name
 
 DATA_MEMBER = "data"
 INDEX_MEMBER = "index.json"
+COVERAGE_MEMBER = "coverage.json"
 
 
 def serialize_frame(frame: pd.DataFrame, fmt: str, compression: str = "zstd") -> bytes:
@@ -88,9 +89,15 @@ def atomic_write(path: Path, data: bytes) -> str:
 
 def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyTier,
                           label_columns: Iterable[str], metric_columns: Iterable[str],
-                          source_id: str,
-                          index_path: str = "") -> Tuple[str, int, List[IndexEntry]]:
-    """封装 data + index.json，注册时间偏移索引与标签索引。"""
+                          source_id: str, index_path: str = "",
+                          coverage: Optional[List[Dict[str, Any]]] = None,
+                          aggregation_mode: str = "global"
+                          ) -> Tuple[str, int, List[IndexEntry]]:
+    """封装 data + index.json（局部聚合时附加 coverage.json），注册两级索引。
+
+    coverage 为 None 时包结构与历史版本逐字节一致；提供覆盖率表时
+    追加 coverage.json 成员并在清单中声明，旧版本读取路径不受影响。
+    """
     labels, metrics = list(label_columns), list(metric_columns)
     payload = serialize_frame(frame, tier.format, tier.compression)
     tags = _column_tags(frame, labels)
@@ -108,9 +115,17 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
     }
     suffix = extension_for(tier.format, tier.compression)
     member_name = f"{DATA_MEMBER}.{suffix}"
-    members = [(member_name, payload),
-               (INDEX_MEMBER, (json.dumps(manifest, ensure_ascii=False, sort_keys=True,
-                                          indent=2) + "\n").encode("utf-8"))]
+    members = [(member_name, payload)]
+    if coverage is not None:
+        coverage_bytes = (json.dumps(coverage, ensure_ascii=False, sort_keys=True,
+                                     indent=2) + "\n").encode("utf-8")
+        members.append((COVERAGE_MEMBER, coverage_bytes))
+        manifest["aggregation_mode"] = aggregation_mode
+        manifest["coverage_member"] = COVERAGE_MEMBER
+        manifest["coverage_entries"] = len(coverage)
+    members.append((INDEX_MEMBER, (json.dumps(manifest, ensure_ascii=False,
+                                              sort_keys=True, indent=2) + "\n")
+                    .encode("utf-8")))
     raw_tar = _make_tar(members)
     offset, size = _member_span(raw_tar, member_name)
     package_bytes = gzip.compress(raw_tar, compresslevel=6, mtime=0)
@@ -121,6 +136,7 @@ def build_archive_package(frame: pd.DataFrame, package_path: Path, tier: PolicyT
         offset=offset, size=size, row_count=int(len(frame)),
         min_ts=min_ts, max_ts=max_ts, tags=tags, tier=tier.name,
         source=source_id,
+        coverage_member=COVERAGE_MEMBER if coverage is not None else "",
     )
     return bytes_sha256(package_bytes), len(package_bytes), [entry]
 
@@ -179,6 +195,19 @@ def read_package_index(package_path: Path) -> Dict[str, Any]:
         if member is None:
             raise ValueError("归档包缺少 index.json")
         return json.loads(member.read().decode("utf-8"))
+
+
+def read_package_coverage(package_path: Path) -> Optional[List[Dict[str, Any]]]:
+    """读取包内组合覆盖率表；旧包没有该成员时返回 None。"""
+    with tarfile.open(Path(package_path), mode="r:gz") as archive:
+        try:
+            member = archive.extractfile(COVERAGE_MEMBER)
+        except KeyError:
+            return None
+        if member is None:
+            return None
+        data = json.loads(member.read().decode("utf-8"))
+    return data if isinstance(data, list) else None
 
 
 def extract_member(package_path: Path, member_name: str, output_dir: Path,
@@ -240,6 +269,7 @@ def entries_for_existing_package(package_path: Path, relative_path: str,
         min_ts=manifest.get("min_ts", ""), max_ts=manifest.get("max_ts", ""),
         tags=manifest.get("tags", {}), tier=manifest.get("tier", ""),
         source=manifest.get("source", ""),
+        coverage_member=manifest.get("coverage_member", ""),
     )]
 
 
